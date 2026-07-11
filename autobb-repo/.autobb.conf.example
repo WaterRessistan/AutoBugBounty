@@ -1,0 +1,21 @@
+# ============================================================================
+#  AutoBugBounty · Configuración de notificaciones
+#  ----------------------------------------------------------------------------
+#  Copia este fichero a ~/.autobb.conf y rellena tus credenciales:
+#
+#      cp .autobb.conf.example ~/.autobb.conf
+#      chmod 600 ~/.autobb.conf       # protege tus tokens
+#
+#  También puedes exportar estas variables como variables de entorno en lugar
+#  de usar este fichero. Puedes configurar solo Discord, solo Telegram o ambos.
+# ============================================================================
+
+# --- Discord --------------------------------------------------------------
+# Ajustes del canal → Integraciones → Webhooks → Nuevo webhook → Copiar URL
+DISCORD_WEBHOOK_URL=""
+
+# --- Telegram -------------------------------------------------------------
+# Token del bot: créalo con @BotFather (https://t.me/BotFather)
+TELEGRAM_BOT_TOKEN=""
+# Tu chat_id: obténlo con @userinfobot (https://t.me/userinfobot)
+TELEGRAM_CHAT_ID=""

@@ -1,0 +1,9 @@
+autobb_results/
+results/
+logs/
+*.log
+.git/
+.github/
+*.md
+.autobb.conf
+.env

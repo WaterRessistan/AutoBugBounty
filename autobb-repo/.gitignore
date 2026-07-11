@@ -1,0 +1,35 @@
+# ---- Resultados de escaneos (nunca subir a git) ----
+autobb_results/
+results/
+*_20*/          # carpetas de target con timestamp
+output/
+out/
+
+# ---- Ficheros de resultados sueltos ----
+*.txt.bak
+*.jsonl
+nuclei_*.txt
+live_hosts*.json
+
+# ---- Configuración con credenciales ----
+.autobb.conf
+*.conf.local
+.env
+*.env
+
+# ---- Logs ----
+logs/
+*.log
+
+# ---- Temporales del sistema / editores ----
+*.tmp
+*.swp
+*~
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# ---- Descargas de herramientas / binarios ----
+findomain
+*.zip
