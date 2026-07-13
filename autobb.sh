@@ -38,7 +38,7 @@ AUTO_INSTALL=true                 # el usuario eligió: auto-instalar lo que fal
 INTENSITY="balanceado"            # conservador | balanceado | agresivo
 BASE_OUTPUT="$(pwd)/autobb_results"
 THREADS_OVERRIDE=""
-PHASE_TIMEOUT_OVERRIDE=""         # minutos; límite por fase pesada (katana/nuclei)
+STALL_OVERRIDE=""                 # minutos de INACTIVIDAD antes de cortar una fase pesada colgada
 declare -a TARGETS=()
 
 # --- Config de notificaciones (por env o por fichero ~/.autobb.conf) ---------
@@ -92,7 +92,7 @@ OPCIONES:
   --no-subs             No enumerar subdominios (trata cada target como host único)
   --intensity <nivel>   conservador | balanceado | agresivo   (def: balanceado)
   --threads <n>         Forzar concurrencia base (httpx/nuclei/katana)
-  --phase-timeout <min> Límite por fase pesada katana/nuclei (def: según intensidad)
+  --stall-timeout <min> Cortar katana/nuclei solo si se cuelgan (min sin actividad; def: 15)
   --output <dir>        Directorio base de resultados (def: ./autobb_results)
   --no-install          No intentar instalar herramientas que falten
   -h, --help            Muestra esta ayuda
@@ -116,7 +116,7 @@ parse_args() {
       --no-subs)     NO_SUBS=true; shift ;;
       --intensity)   INTENSITY="${2:-}"; shift 2 ;;
       --threads)     THREADS_OVERRIDE="${2:-}"; shift 2 ;;
-      --phase-timeout) PHASE_TIMEOUT_OVERRIDE="${2:-}"; shift 2 ;;
+      --stall-timeout) STALL_OVERRIDE="${2:-}"; shift 2 ;;
       --output)      BASE_OUTPUT="${2:-}"; shift 2 ;;
       --no-install)  AUTO_INSTALL=false; shift ;;
       -h|--help)     usage; exit 0 ;;
@@ -141,20 +141,27 @@ parse_args() {
 # ------------------------------------------------------- AJUSTES INTENSIDAD --
 set_intensity() {
   case "$INTENSITY" in
-    conservador) HTTPX_THREADS=50;  NUCLEI_RL=30;  NUCLEI_C=25;  KATANA_C=10; KATANA_DEPTH=2; KATANA_RL=50;  NAABU_RATE=500;  DALFOX_WORKERS=10; TMO_HEAVY=2400 ;;
-    balanceado)  HTTPX_THREADS=100; NUCLEI_RL=100; NUCLEI_C=50;  KATANA_C=25; KATANA_DEPTH=3; KATANA_RL=150; NAABU_RATE=1000; DALFOX_WORKERS=25; TMO_HEAVY=3600 ;;
-    agresivo)    HTTPX_THREADS=200; NUCLEI_RL=300; NUCLEI_C=100; KATANA_C=50; KATANA_DEPTH=5; KATANA_RL=300; NAABU_RATE=3000; DALFOX_WORKERS=40; TMO_HEAVY=5400 ;;
+    conservador) HTTPX_THREADS=50;  NUCLEI_RL=30;  NUCLEI_C=25;  KATANA_C=10; KATANA_DEPTH=2; KATANA_RL=50;  NAABU_RATE=500;  DALFOX_WORKERS=10 ;;
+    balanceado)  HTTPX_THREADS=100; NUCLEI_RL=100; NUCLEI_C=50;  KATANA_C=25; KATANA_DEPTH=3; KATANA_RL=150; NAABU_RATE=1000; DALFOX_WORKERS=25 ;;
+    agresivo)    HTTPX_THREADS=200; NUCLEI_RL=300; NUCLEI_C=100; KATANA_C=50; KATANA_DEPTH=5; KATANA_RL=300; NAABU_RATE=3000; DALFOX_WORKERS=40 ;;
   esac
   if [ -n "$THREADS_OVERRIDE" ]; then
     HTTPX_THREADS="$THREADS_OVERRIDE"; NUCLEI_C="$THREADS_OVERRIDE"; KATANA_C="$THREADS_OVERRIDE"
   fi
-  # Límites de tiempo por fase (segundos). Impiden que una herramienta se
-  # quede colgada indefinidamente: si se alcanza, se corta y se continúa.
+
+  # --- Tolerancias de tiempo -------------------------------------------------
+  # Herramientas ligeras/medias: tope de tiempo fijo (están acotadas y son
+  # rápidas; un cuelgue aquí es raro y un límite simple basta).
   TMO_LIGHT=600     # enumeración, dnsx, wayback/gau, subzy   (10 min)
   TMO_MED=1200      # naabu, httpx, dalfox                    (20 min)
-  # TMO_HEAVY (katana/nuclei) viene por intensidad arriba; override manual:
-  if [ -n "$PHASE_TIMEOUT_OVERRIDE" ]; then
-    TMO_HEAVY=$(( PHASE_TIMEOUT_OVERRIDE * 60 ))
+
+  # Herramientas pesadas (katana, nuclei): NO se cortan por tiempo total.
+  # Se vigila la INACTIVIDAD: solo se detienen si pasan STALL_HEAVY segundos
+  # sin escribir NADA (ni resultados ni estadísticas) = realmente colgadas.
+  # Si progresan, corren las horas que hagan falta.
+  STALL_HEAVY=900   # 15 min sin actividad → se considera colgado
+  if [ -n "$STALL_OVERRIDE" ]; then
+    STALL_HEAVY=$(( STALL_OVERRIDE * 60 ))
   fi
 }
 
@@ -370,6 +377,52 @@ gtrun() {
   trun "$name" "$secs" "$@"
 }
 
+# wrun: ejecuta con VIGILANTE DE INACTIVIDAD (no con tope de tiempo total).
+# Solo detiene el proceso si pasan 'stall' segundos sin que crezca NI su
+# fichero de salida NI su log (es decir, solo si está realmente colgado).
+# Mientras progrese, corre sin límite las horas que haga falta.
+#   wrun <name> <fichero_a_vigilar> <stall_seg> <cmd...>
+wrun() {
+  local name="$1" watch="$2" stall="$3"; shift 3
+  local logf="logs/${name}.log"
+  log "Ejecutando ${name} (se corta solo si se cuelga >$(( stall / 60 )) min sin actividad)…"
+
+  "$@" >>"$logf" 2>&1 &
+  local pid=$!
+
+  local last_size=-1 last_change now idle cur s f interval=20
+  last_change="$(date +%s)"
+
+  while kill -0 "$pid" 2>/dev/null; do
+    sleep "$interval"
+    cur=0
+    for f in "$logf" "$watch"; do
+      if [ -f "$f" ]; then s="$(wc -c <"$f" 2>/dev/null || echo 0)"; cur=$(( cur + s )); fi
+    done
+    now="$(date +%s)"
+    if [ "$cur" != "$last_size" ]; then last_size="$cur"; last_change="$now"; fi
+    idle=$(( now - last_change ))
+    if [ "$idle" -ge "$stall" ]; then
+      warn "${name}: ${idle}s sin actividad → parece colgado; deteniéndolo y continuando…"
+      kill -INT "$pid" 2>/dev/null
+      sleep 15
+      kill -KILL "$pid" 2>/dev/null
+      wait "$pid" 2>/dev/null || true
+      return 0
+    fi
+  done
+
+  wait "$pid"; local rc=$?
+  if [ "$rc" -eq 0 ]; then ok "${name} OK"
+  else warn "${name} terminó con avisos (ver ${logf})"; fi
+}
+# gwrun: wrun + comprobación de que la herramienta exista.
+gwrun() {
+  local name="$1" tool="$2" watch="$3" stall="$4"; shift 4
+  have "$tool" || { warn "'${tool}' no disponible → se omite ${name}"; return 0; }
+  wrun "$name" "$watch" "$stall" "$@"
+}
+
 # ============================================================================
 #  PROCESADO DE UN TARGET
 # ============================================================================
@@ -451,7 +504,7 @@ process_target() {
   # --------------------------- FASE 4: CRAWLING Y RECOLECCIÓN DE URLs -------
   step "FASE 4 · Crawling con Katana + wayback + gau"
   if [ -s subdomains/live_urls.txt ]; then
-    gtrun katana katana "$TMO_HEAVY" katana \
+    gwrun katana katana urls/katana.txt "$STALL_HEAVY" katana \
         -list subdomains/live_urls.txt \
         -d "$KATANA_DEPTH" \
         -jc -kf all \
@@ -499,7 +552,7 @@ process_target() {
   # ----------------------------- FASE 6: ESCANEO DE VULNERABILIDADES --------
   step "FASE 6 · Escaneo de vulnerabilidades (nuclei + dalfox)"
   if [ -s subdomains/live_urls.txt ]; then
-    gtrun nuclei nuclei "$TMO_HEAVY" nuclei \
+    gwrun nuclei nuclei vulns/nuclei_hosts.txt "$STALL_HEAVY" nuclei \
         -l subdomains/live_urls.txt \
         -severity critical,high,medium,low,info \
         -tags cve,misconfig,exposure,takeover,xss,sqli,ssrf,lfi,rce,default-login,redirect \
@@ -510,7 +563,7 @@ process_target() {
   fi
 
   if [ -s urls/all_urls_clean.txt ]; then
-    gtrun nuclei-urls nuclei "$TMO_HEAVY" nuclei \
+    gwrun nuclei-urls nuclei vulns/nuclei_urls.txt "$STALL_HEAVY" nuclei \
         -l urls/all_urls_clean.txt \
         -severity critical,high,medium,low \
         -tags cve,misconfig,exposure,xss,sqli,ssrf,lfi,rce,redirect,injection \
@@ -520,11 +573,11 @@ process_target() {
 
   cat urls/params/*.txt 2>/dev/null | sort -u > urls/params/_all_params.txt || true
   if [ -s urls/params/_all_params.txt ]; then
-    gtrun nuclei-params nuclei "$TMO_HEAVY" nuclei \
+    gwrun nuclei-params nuclei vulns/nuclei_params.txt "$STALL_HEAVY" nuclei \
         -l urls/params/_all_params.txt \
         -severity critical,high,medium \
         -tags xss,sqli,ssrf,lfi,rce,redirect,injection \
-        -dast -rl "$NUCLEI_RL" -c "$NUCLEI_C" -timeout 5 -retries 1 -silent \
+        -dast -rl "$NUCLEI_RL" -c "$NUCLEI_C" -timeout 5 -retries 1 -silent -stats \
         -o vulns/nuclei_params.txt
   fi
 
@@ -632,7 +685,7 @@ main() {
 
   banner
   echo -e "${BOLD}Targets:${NC}    ${GREEN}${TARGETS[*]}${NC}"
-  echo -e "${BOLD}Intensidad:${NC} ${GREEN}${INTENSITY}${NC}   ${BOLD}Subdominios:${NC} ${GREEN}$([ "$NO_SUBS" = true ] && echo OFF || echo ON)${NC}   ${BOLD}Límite/fase:${NC} ${GREEN}$(( TMO_HEAVY / 60 )) min${NC}"
+  echo -e "${BOLD}Intensidad:${NC} ${GREEN}${INTENSITY}${NC}   ${BOLD}Subdominios:${NC} ${GREEN}$([ "$NO_SUBS" = true ] && echo OFF || echo ON)${NC}   ${BOLD}Corte por inactividad:${NC} ${GREEN}$(( STALL_HEAVY / 60 )) min${NC}"
   echo -e "${BOLD}Salida:${NC}     ${GREEN}${BASE_OUTPUT}${NC}\n"
 
   if ! have timeout; then
