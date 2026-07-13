@@ -188,11 +188,11 @@ docker run --rm -it \
 
 ## 🤝 Contribuir
 
-¡Las contribuciones son bienvenidas! Lee [`CONTRIBUTING.md`](autobb-repo/CONTRIBUTING.md) y el [código de conducta](CODE_OF_CONDUCT.md) antes de abrir un *issue* o *pull request*.
+¡Las contribuciones son bienvenidas! Lee [`CONTRIBUTING.md`](CONTRIBUTING.md) y el [código de conducta](CODE_OF_CONDUCT.md) antes de abrir un *issue* o *pull request*.
 
 ## 📝 Licencia
 
-Distribuido bajo la licencia **MIT**. Consulta [`LICENSE`](autobb-repo/LICENSE) para más detalles.
+Distribuido bajo la licencia **MIT**. Consulta [`LICENSE`](LICENSE) para más detalles.
 
 ---
 

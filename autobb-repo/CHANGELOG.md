@@ -5,6 +5,18 @@ Todos los cambios notables de este proyecto se documentan en este fichero.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/)
 y el proyecto sigue [Versionado Semántico](https://semver.org/lang/es/).
 
+## [2.1.0] - 2026-07-12
+
+### Añadido
+- **Vigilante de inactividad para katana y nuclei**: en vez de un tope de tiempo fijo (que cortaría un escaneo que va lento pero bien), estas fases solo se detienen si pasan `STALL_HEAVY` segundos (15 min por defecto) **sin escribir nada** ni en resultados ni en el log de progreso (`-stats`) — es decir, solo si están realmente colgadas. Si progresan, corren sin límite.
+- **Tope de tiempo fijo para herramientas ligeras/medias** (enumeración, dnsx, naabu, httpx, wayback/gau, subzy, dalfox), que sí están acotadas: 10–20 min.
+- Nuevo flag `--stall-timeout <min>` para ajustar el umbral de inactividad de las fases pesadas.
+- Aviso al arranque si `timeout` (coreutils) no está disponible.
+
+### Cambiado
+- `nuclei` sobre URLs y parámetros usa `-timeout 5 -retries 1` (antes 10/2) para descartar rápido hosts caídos; `nuclei` (hosts) y `katana` a `-timeout 8`. `-stats` activo en las tres fases de nuclei (además de informar, sirve de señal de progreso para el vigilante).
+- Todas las herramientas de red se ejecutan mediante wrappers con control de tiempo (`trun`/`gtrun` fijo, `wrun`/`gwrun` por inactividad).
+
 ## [2.0.0] - 2026-07-09
 
 ### Añadido
