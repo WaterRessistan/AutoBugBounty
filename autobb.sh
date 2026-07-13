@@ -336,6 +336,28 @@ sanitize_target() {                    # deja solo el host
   printf '%s' "$t"
 }
 
+# Filtra un fichero de URLs dejando SOLO las que están dentro del scope.
+#   --no-subs : únicamente los hosts exactos de subdomains/all_subs.txt
+#   normal    : el dominio objetivo y sus subdominios (host == target o *.target)
+# Usa la variable $target y $NO_SUBS del contexto de process_target.
+in_scope_filter() {
+  local infile="$1" outfile="$2"
+  if [ ! -s "$infile" ]; then : > "$outfile"; return; fi
+  if $NO_SUBS; then
+    awk -v hosts="$(paste -sd, subdomains/all_subs.txt 2>/dev/null)" '
+      BEGIN { n = split(hosts, a, ","); for (i = 1; i <= n; i++) ok[a[i]] = 1 }
+      { u = $0; sub(/^[a-zA-Z]+:\/\//, "", u); sub(/[\/?#].*$/, "", u); sub(/:.*/, "", u)
+        if (u in ok) print $0 }
+    ' "$infile" > "$outfile"
+  else
+    awk -v t="$target" '
+      BEGIN { esc = t; gsub(/\./, "\\.", esc) }
+      { u = $0; sub(/^[a-zA-Z]+:\/\//, "", u); sub(/[\/?#].*$/, "", u); sub(/:.*/, "", u)
+        if (u == t || u ~ ("\\." esc "$")) print $0 }
+    ' "$infile" > "$outfile"
+  fi
+}
+
 # Ejecuta un comando registrando su salida en logs/<name>.log
 run() {
   local name="$1"; shift
@@ -503,13 +525,16 @@ process_target() {
 
   # --------------------------- FASE 4: CRAWLING Y RECOLECCIÓN DE URLs -------
   step "FASE 4 · Crawling con Katana + wayback + gau"
+  # Scope de Katana: con --no-subs, solo el host exacto (fqdn); si no, el
+  # dominio raíz y sus subdominios (rdn).
+  local katana_scope="rdn"; $NO_SUBS && katana_scope="fqdn"
   if [ -s subdomains/live_urls.txt ]; then
     gwrun katana katana urls/katana.txt "$STALL_HEAVY" katana \
         -list subdomains/live_urls.txt \
         -d "$KATANA_DEPTH" \
         -jc -kf all \
         -ps -pss waybackarchive,commoncrawl,alienvault \
-        -fs rdn \
+        -fs "$katana_scope" \
         -c "$KATANA_C" -rl "$KATANA_RL" \
         -timeout 8 -retry 1 -silent -nc \
         -ef woff,woff2,css,png,svg,jpg,jpeg,gif,ico,ttf,eot \
@@ -522,12 +547,17 @@ process_target() {
 
   cat urls/katana.txt urls/wayback.txt urls/gau.txt 2>/dev/null | sort -u > urls/all_urls.txt || true
   if have uro && [ -s urls/all_urls.txt ]; then
-    uro -i urls/all_urls.txt -o urls/all_urls_clean.txt 2>/dev/null || cp urls/all_urls.txt urls/all_urls_clean.txt
+    uro -i urls/all_urls.txt -o urls/all_urls_raw.txt 2>/dev/null || cp urls/all_urls.txt urls/all_urls_raw.txt
   else
-    cp urls/all_urls.txt urls/all_urls_clean.txt 2>/dev/null || : > urls/all_urls_clean.txt
+    cp urls/all_urls.txt urls/all_urls_raw.txt 2>/dev/null || : > urls/all_urls_raw.txt
   fi
-  local n_urls; n_urls="$(count_lines urls/all_urls_clean.txt)"
-  ok "URLs recolectadas (tras uro): ${BOLD}${n_urls}${NC}"
+  # Filtro de SCOPE: descarta cualquier URL fuera del objetivo antes de escanear
+  in_scope_filter urls/all_urls_raw.txt urls/all_urls_clean.txt
+  local n_raw n_urls n_off
+  n_raw="$(count_lines urls/all_urls_raw.txt)"
+  n_urls="$(count_lines urls/all_urls_clean.txt)"
+  n_off=$(( n_raw - n_urls ))
+  ok "URLs recolectadas: ${BOLD}${n_raw}${NC} · en scope: ${BOLD}${n_urls}${NC} · descartadas fuera de scope: ${BOLD}${n_off}${NC}"
 
   # ------------------------- FASE 5: FILTRADO SENSIBLE / PARÁMETROS ---------
   step "FASE 5 · Archivos sensibles y parámetros interesantes"
@@ -616,7 +646,7 @@ process_target() {
     echo "---------------------------- RECON -----------------------------"
     printf "  Subdominios únicos : %s\n" "$n_subs"
     printf "  Hosts vivos        : %s\n" "$n_live"
-    printf "  URLs recolectadas  : %s\n" "$n_urls"
+    printf "  URLs en scope      : %s\n" "$n_urls"
     printf "  Archivos sensibles : %s\n" "$n_sensitive"
     printf "  URLs con params    : %s\n" "$n_params"
     echo
