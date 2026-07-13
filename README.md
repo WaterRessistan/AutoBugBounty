@@ -2,12 +2,12 @@
 
 <p align="center">
   <b>Recon y escaneo de vulnerabilidades automatizado para Bug Bounty y pentesting autorizado.</b><br>
-  Un solo script en Bash que orquesta las mejores herramientas del ecosistema y te entrega un resumen accionable por cada objetivo.
+  Un solo script en Bash que orquesta las mejores herramientas del ecosistema y te entrega un resumen accionable, <b>dentro de scope</b>, por cada objetivo.
 </p>
 
 <p align="center">
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
-  <a href="https://github.com/USUARIO/REPO/actions/workflows/shellcheck.yml"><img src="https://github.com/USUARIO/REPO/actions/workflows/shellcheck.yml/badge.svg" alt="ShellCheck"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/licencia-Uso%20abierto%20(sin%20reventa)-blue.svg" alt="Licencia: Uso abierto sin reventa"></a>
+  <a href="https://github.com/WaterRessistan/AutoBugBounty/actions/workflows/shellcheck.yml"><img src="https://github.com/WaterRessistan/AutoBugBounty/actions/workflows/shellcheck.yml/badge.svg" alt="ShellCheck"></a>
   <img src="https://img.shields.io/badge/shell-bash-121011.svg?logo=gnu-bash&logoColor=white" alt="Bash">
   <img src="https://img.shields.io/badge/plataforma-Linux-important.svg?logo=linux&logoColor=white" alt="Linux">
   <a href="CONTRIBUTING.md"><img src="https://img.shields.io/badge/PRs-bienvenidos-brightgreen.svg" alt="PRs welcome"></a>
@@ -26,7 +26,9 @@
 - [Instalación](#-instalación)
 - [Configuración de notificaciones](#-configuración-de-notificaciones)
 - [Uso](#-uso)
+- [Scope: ¿con o sin subdominios?](#-scope-con-o-sin-subdominios)
 - [Niveles de intensidad](#-niveles-de-intensidad)
+- [Control de tiempo: nada se cuelga eternamente](#-control-de-tiempo-nada-se-cuelga-eternamente)
 - [Estructura de resultados](#-estructura-de-resultados)
 - [Docker](#-docker)
 - [Contribuir](#-contribuir)
@@ -34,10 +36,12 @@
 
 ## ✨ Características
 
-- **Multi-target en cola.** Pasa uno o varios dominios; cada uno se procesa de forma aislada con su propia carpeta y su `summary.txt`.
-- **Flag `--no-subs`.** Omite la enumeración de subdominios y trata cada argumento como un host único (ideal para atacar un endpoint concreto).
+- **Multi-target en cola.** Pasa uno o varios objetivos; cada uno se procesa de forma aislada con su propia carpeta y su `summary.txt`.
+- **Filtrado por scope automático.** Antes de escanear, descarta cualquier URL fuera de alcance: con `--no-subs` deja solo el host exacto; sin él, solo el dominio objetivo y sus subdominios. Nunca escanea ni reporta terceros/CDN u otros subdominios fuera de scope.
+- **Flag `--no-subs`.** Omite la enumeración de subdominios y trata cada argumento como un host único (ideal para programas con scope de un host concreto).
 - **Flujo de 7 fases**: subdominios → resolución/hosts vivos → subdomain takeover → crawling (Katana) → filtrado de URLs sensibles/parámetros → escaneo de vulnerabilidades → reporte.
-- **Katana en dos vías**: fuentes *passive* (Wayback, CommonCrawl, AlienVault) + *crawl* activo sobre los hosts ya confirmados vivos, con *scope* limitado al dominio raíz.
+- **Katana con scope adaptativo**: fuentes *passive* (Wayback, CommonCrawl, AlienVault) + *crawl* activo sobre los hosts vivos, limitado **al host exacto** con `--no-subs` (`fqdn`) o **al dominio raíz y sus subdominios** en modo normal (`rdn`).
+- **Corte solo si se cuelga (watchdog).** Las fases pesadas (katana/nuclei) **no** tienen tope de tiempo: corren las horas que hagan falta mientras progresen, y solo se detienen si se quedan realmente colgadas (sin actividad). Ver [Control de tiempo](#-control-de-tiempo-nada-se-cuelga-eternamente).
 - **Notificaciones Discord + Telegram** nativas (solo `curl`), con envío del `summary.txt` adjunto al terminar cada target y un resumen global.
 - **Auto-instalación** de dependencias que falten (Go, pip/pipx, binarios y patrones).
 - **Intensidad configurable** (`conservador` · `balanceado` · `agresivo`) para respetar los límites de cada programa.
@@ -62,7 +66,7 @@
 
 - **Linux** (probado en Debian/Ubuntu/Kali) y **Bash ≥ 4.4**.
 - **Go ≥ 1.21** (para instalar la mayoría de herramientas).
-- `git`, `curl`, `jq`, `unzip` y `libpcap-dev`.
+- `git`, `curl`, `jq`, `unzip`, `libpcap-dev` y `timeout` (coreutils, ya viene en Linux).
 - Python 3 con `pipx` o `pip3` (para `uro`, `subdominator`, `sublist3r`).
 
 > El script intenta instalar automáticamente todo lo anterior. Si prefieres gestionarlo tú, usa `--no-install`. Para evitar el dolor de cabeza de las dependencias, echa un vistazo a la sección [Docker](#-docker).
@@ -70,8 +74,8 @@
 ## 🚀 Instalación
 
 ```bash
-git clone https://github.com/USUARIO/REPO.git
-cd REPO
+git clone https://github.com/WaterRessistan/AutoBugBounty.git
+cd AutoBugBounty
 chmod +x autobb.sh
 
 # Primera ejecución: instala las herramientas que falten automáticamente
@@ -116,6 +120,7 @@ OPCIONES:
   --no-subs             No enumerar subdominios (trata cada target como host único)
   --intensity <nivel>   conservador | balanceado | agresivo   (def: balanceado)
   --threads <n>         Forzar concurrencia base (httpx/nuclei/katana)
+  --stall-timeout <min> Cortar katana/nuclei solo si se cuelgan (min sin actividad; def: 15)
   --output <dir>        Directorio base de resultados (def: ./autobb_results)
   --no-install          No intentar instalar herramientas que falten
   -h, --help            Muestra la ayuda
@@ -124,18 +129,33 @@ OPCIONES:
 ### Ejemplos
 
 ```bash
-# Recon + escaneo completo de un dominio (con enumeración de subdominios)
+# Scope wildcard (*.example.com): enumera subdominios y escanea el dominio y sus subdominios
 ./autobb.sh example.com
 
-# Varios hosts concretos, sin buscar subdominios, procesados en cola
-./autobb.sh --no-subs app.example.com api.example.com
+# Scope de host(s) concreto(s): sin enumerar subdominios, en cola, cada uno en su carpeta
+./autobb.sh --no-subs www.example.com api.example.com
 
-# Varios objetivos a intensidad agresiva
-./autobb.sh --intensity agresivo target1.com target2.com
+# Varios objetivos suaves para no saturar la máquina
+./autobb.sh --no-subs --intensity conservador host1.com host2.com
 
 # Guardando en una ruta concreta y forzando concurrencia
 ./autobb.sh --output ~/hunts/acme --threads 150 acme.com
 ```
+
+## 🎯 Scope: ¿con o sin subdominios?
+
+**Elige según lo que diga literalmente el scope del programa.** El script filtra las URLs automáticamente para no salirse de alcance.
+
+| Lo que dice el scope | Comando | Qué escanea |
+|---|---|---|
+| Host exacto — `www.example.com` | `./autobb.sh --no-subs www.example.com` | **Solo** ese host |
+| Wildcard — `*.example.com` | `./autobb.sh example.com` | El dominio y **todos** sus subdominios |
+| Varios hosts exactos | `./autobb.sh --no-subs host1 host2 host3` | Cada host, por separado |
+
+- Con **`--no-subs`**: no se enumeran subdominios, Katana se ciñe al host exacto (`fqdn`) y el filtro final deja **solo URLs de ese host** (descarta `marketing.`, `api.`, terceros…).
+- **Sin `--no-subs`**: se enumeran subdominios, Katana usa el dominio raíz (`rdn`) y el filtro deja **solo `*.dominio-objetivo`** (descarta terceros/CDN).
+
+> ⚠️ En `--no-subs`, pasa el host **exacto** del scope. `www.example.com` y `example.com` no son lo mismo: usa el que aparezca en el programa.
 
 ## 🎚️ Niveles de intensidad
 
@@ -145,19 +165,31 @@ OPCIONES:
 | `balanceado` *(def)* | 100 | 100 / 50 | 3 / 25 | 1000 |
 | `agresivo` | 200 | 300 / 100 | 5 / 50 | 3000 |
 
+> Si lanzas **varios objetivos en paralelo** en la misma máquina, usa `--intensity conservador` para no saturar CPU/red.
+
+## ⏱️ Control de tiempo: nada se cuelga eternamente
+
+El escaneo se protege contra bloqueos sin cortar el trabajo legítimo:
+
+- **Herramientas ligeras/medias** (enumeración, `dnsx`, `httpx`, `naabu`, `wayback`/`gau`, `subzy`, `dalfox`): tope de tiempo fijo (10–20 min). Están acotadas y un cuelgue aquí es raro.
+- **Herramientas pesadas** (`katana`, `nuclei`): **vigilante de inactividad** en lugar de tope fijo. Corren sin límite mientras **progresen** (escriban resultados o estadísticas). Solo se detienen si pasan **15 min sin actividad** (ajustable con `--stall-timeout <min>`) — es decir, solo si están de verdad colgadas. Así un escaneo grande de horas termina entero, pero un cuelgue no bloquea la cola.
+
+`nuclei` además usa `-timeout 5 -retries 1` en las fases de URLs/parámetros para descartar rápido los hosts caídos.
+
 ## 📂 Estructura de resultados
 
 ```text
 autobb_results/
 └── example.com_20260709_154326/
     ├── subdomains/
-    │   ├── all_subs.txt          # subdominios únicos consolidados
+    │   ├── all_subs.txt          # subdominios únicos consolidados (o el host, con --no-subs)
     │   ├── resolved.txt          # los que resuelven (dnsx)
     │   ├── live_hosts.txt        # hosts vivos legibles (url | código | título | tech)
     │   ├── live_urls.txt         # solo URLs vivas
     │   └── takeover.txt          # posibles subdomain takeovers
     ├── urls/
-    │   ├── all_urls_clean.txt    # todas las URLs, deduplicadas con uro
+    │   ├── all_urls_raw.txt      # todas las URLs recolectadas (antes de filtrar)
+    │   ├── all_urls_clean.txt    # 👈 SOLO las que están EN SCOPE (lo que se escanea)
     │   ├── sensitive_files.txt   # ficheros potencialmente sensibles
     │   └── params/               # parámetros clasificados por tipo (xss, sqli, ...)
     ├── vulns/
@@ -167,7 +199,7 @@ autobb_results/
     └── summary.txt               # 👈 RESUMEN DE VULNERABILIDADES del target
 ```
 
-El `summary.txt` incluye el recuento por severidad (crítica/alta/media/baja/info), los hallazgos críticos y altos listados, posibles takeovers, XSS confirmados y una muestra de ficheros sensibles.
+Al terminar la fase de crawling verás un recuento del tipo `URLs recolectadas: 26330 · en scope: 412 · descartadas fuera de scope: 25918`. El `summary.txt` incluye las URLs en scope, el recuento por severidad (crítica/alta/media/baja/info), los hallazgos críticos y altos listados, posibles takeovers, XSS confirmados y una muestra de ficheros sensibles.
 
 ## 🐳 Docker
 
@@ -192,7 +224,7 @@ docker run --rm -it \
 
 ## 📝 Licencia
 
-Distribuido bajo la licencia **MIT**. Consulta [`LICENSE`](LICENSE) para más detalles.
+Distribuido bajo una licencia de **uso abierto sin reventa** (basada en MIT). Puedes usarla, modificarla y distribuirla libremente, **incluso para trabajo remunerado** (bug bounty, pentesting, consultoría…), pero **no vender el software** ni ofrecerlo como producto/servicio de pago. Cualquier redistribución debe seguir siendo gratuita y con esta misma licencia. Consulta [`LICENSE`](LICENSE) para el texto completo.
 
 ---
 
