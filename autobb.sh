@@ -38,6 +38,7 @@ AUTO_INSTALL=true                 # el usuario eligió: auto-instalar lo que fal
 INTENSITY="balanceado"            # conservador | balanceado | agresivo
 BASE_OUTPUT="$(pwd)/autobb_results"
 THREADS_OVERRIDE=""
+PHASE_TIMEOUT_OVERRIDE=""         # minutos; límite por fase pesada (katana/nuclei)
 declare -a TARGETS=()
 
 # --- Config de notificaciones (por env o por fichero ~/.autobb.conf) ---------
@@ -91,6 +92,7 @@ OPCIONES:
   --no-subs             No enumerar subdominios (trata cada target como host único)
   --intensity <nivel>   conservador | balanceado | agresivo   (def: balanceado)
   --threads <n>         Forzar concurrencia base (httpx/nuclei/katana)
+  --phase-timeout <min> Límite por fase pesada katana/nuclei (def: según intensidad)
   --output <dir>        Directorio base de resultados (def: ./autobb_results)
   --no-install          No intentar instalar herramientas que falten
   -h, --help            Muestra esta ayuda
@@ -114,6 +116,7 @@ parse_args() {
       --no-subs)     NO_SUBS=true; shift ;;
       --intensity)   INTENSITY="${2:-}"; shift 2 ;;
       --threads)     THREADS_OVERRIDE="${2:-}"; shift 2 ;;
+      --phase-timeout) PHASE_TIMEOUT_OVERRIDE="${2:-}"; shift 2 ;;
       --output)      BASE_OUTPUT="${2:-}"; shift 2 ;;
       --no-install)  AUTO_INSTALL=false; shift ;;
       -h|--help)     usage; exit 0 ;;
@@ -138,12 +141,20 @@ parse_args() {
 # ------------------------------------------------------- AJUSTES INTENSIDAD --
 set_intensity() {
   case "$INTENSITY" in
-    conservador) HTTPX_THREADS=50;  NUCLEI_RL=30;  NUCLEI_C=25;  KATANA_C=10; KATANA_DEPTH=2; KATANA_RL=50;  NAABU_RATE=500;  DALFOX_WORKERS=10 ;;
-    balanceado)  HTTPX_THREADS=100; NUCLEI_RL=100; NUCLEI_C=50;  KATANA_C=25; KATANA_DEPTH=3; KATANA_RL=150; NAABU_RATE=1000; DALFOX_WORKERS=25 ;;
-    agresivo)    HTTPX_THREADS=200; NUCLEI_RL=300; NUCLEI_C=100; KATANA_C=50; KATANA_DEPTH=5; KATANA_RL=300; NAABU_RATE=3000; DALFOX_WORKERS=40 ;;
+    conservador) HTTPX_THREADS=50;  NUCLEI_RL=30;  NUCLEI_C=25;  KATANA_C=10; KATANA_DEPTH=2; KATANA_RL=50;  NAABU_RATE=500;  DALFOX_WORKERS=10; TMO_HEAVY=2400 ;;
+    balanceado)  HTTPX_THREADS=100; NUCLEI_RL=100; NUCLEI_C=50;  KATANA_C=25; KATANA_DEPTH=3; KATANA_RL=150; NAABU_RATE=1000; DALFOX_WORKERS=25; TMO_HEAVY=3600 ;;
+    agresivo)    HTTPX_THREADS=200; NUCLEI_RL=300; NUCLEI_C=100; KATANA_C=50; KATANA_DEPTH=5; KATANA_RL=300; NAABU_RATE=3000; DALFOX_WORKERS=40; TMO_HEAVY=5400 ;;
   esac
   if [ -n "$THREADS_OVERRIDE" ]; then
     HTTPX_THREADS="$THREADS_OVERRIDE"; NUCLEI_C="$THREADS_OVERRIDE"; KATANA_C="$THREADS_OVERRIDE"
+  fi
+  # Límites de tiempo por fase (segundos). Impiden que una herramienta se
+  # quede colgada indefinidamente: si se alcanza, se corta y se continúa.
+  TMO_LIGHT=600     # enumeración, dnsx, wayback/gau, subzy   (10 min)
+  TMO_MED=1200      # naabu, httpx, dalfox                    (20 min)
+  # TMO_HEAVY (katana/nuclei) viene por intensidad arriba; override manual:
+  if [ -n "$PHASE_TIMEOUT_OVERRIDE" ]; then
+    TMO_HEAVY=$(( PHASE_TIMEOUT_OVERRIDE * 60 ))
   fi
 }
 
@@ -332,6 +343,33 @@ grun() {
   run "$name" "$@"
 }
 
+# trun: como run, pero con LÍMITE DE TIEMPO. Si la herramienta se cuelga y
+# supera el límite, se le envía Ctrl+C (y KILL 30 s después) y el script
+# continúa con los resultados parciales. Evita que una fase bloquee horas.
+trun() {
+  local name="$1" secs="$2"; shift 2
+  log "Ejecutando ${name} (límite ${secs}s)…"
+  local rc=0
+  if have timeout; then
+    timeout --kill-after=30s --signal=INT "$secs" "$@" >>"logs/${name}.log" 2>&1 || rc=$?
+  else
+    "$@" >>"logs/${name}.log" 2>&1 || rc=$?
+  fi
+  if [ "$rc" -eq 0 ]; then
+    ok "${name} OK"
+  elif [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ] || [ "$rc" -eq 130 ]; then
+    warn "${name} alcanzó el límite de ${secs}s; se detuvo y se continúa (resultados parciales)"
+  else
+    warn "${name} terminó con avisos (ver logs/${name}.log)"
+  fi
+}
+# gtrun: trun + comprobación de que la herramienta exista.
+gtrun() {
+  local name="$1" tool="$2" secs="$3"; shift 3
+  have "$tool" || { warn "'${tool}' no disponible → se omite ${name}"; return 0; }
+  trun "$name" "$secs" "$@"
+}
+
 # ============================================================================
 #  PROCESADO DE UN TARGET
 # ============================================================================
@@ -354,11 +392,11 @@ process_target() {
     echo "$target" > subdomains/all_subs.txt
   else
     step "FASE 1 · Enumeración de subdominios"
-    grun subfinder    subfinder    subfinder -d "$target" -all -recursive -silent -o subdomains/subfinder.txt
-    grun assetfinder  assetfinder  bash -c "assetfinder --subs-only '$target' > subdomains/assetfinder.txt"
-    grun findomain    findomain    findomain -t "$target" -q -u subdomains/findomain.txt
-    grun subdominator subdominator subdominator -d "$target" -o subdomains/subdominator.txt
-    grun sublist3r    sublist3r    sublist3r -d "$target" -t 50 -o subdomains/sublist3r.txt
+    gtrun subfinder    subfinder    "$TMO_LIGHT" subfinder -d "$target" -all -recursive -silent -o subdomains/subfinder.txt
+    gtrun assetfinder  assetfinder  "$TMO_LIGHT" bash -c "assetfinder --subs-only '$target' > subdomains/assetfinder.txt"
+    gtrun findomain    findomain    "$TMO_LIGHT" findomain -t "$target" -q -u subdomains/findomain.txt
+    gtrun subdominator subdominator "$TMO_LIGHT" subdominator -d "$target" -o subdomains/subdominator.txt
+    gtrun sublist3r    sublist3r    "$TMO_LIGHT" sublist3r -d "$target" -t 50 -o subdomains/sublist3r.txt
 
     log "Consolidando subdominios…"
     cat subdomains/*.txt 2>/dev/null \
@@ -374,7 +412,7 @@ process_target() {
 
   # -------------------------------- FASE 2: RESOLUCIÓN Y HOSTS VIVOS --------
   step "FASE 2 · Resolución DNS y detección de hosts vivos"
-  grun dnsx dnsx dnsx -l subdomains/all_subs.txt -silent -o subdomains/resolved.txt
+  gtrun dnsx dnsx "$TMO_LIGHT" dnsx -l subdomains/all_subs.txt -silent -o subdomains/resolved.txt
   [ -s subdomains/resolved.txt ] || cp subdomains/all_subs.txt subdomains/resolved.txt
 
   # Port scan opcional (naabu, connect scan → funciona sin root) para hallar
@@ -382,12 +420,12 @@ process_target() {
   local httpx_input="subdomains/resolved.txt"
   local -a PORTS_ARG=(-ports "80,443,8080,8443,8000,8888,3000,5000,9000")
   if have naabu; then
-    run naabu naabu -l subdomains/resolved.txt -top-ports 100 -rate "$NAABU_RATE" -scan-type c -silent -o subdomains/naabu.txt
+    trun naabu "$TMO_MED" naabu -l subdomains/resolved.txt -top-ports 100 -rate "$NAABU_RATE" -scan-type c -silent -o subdomains/naabu.txt
     if [ -s subdomains/naabu.txt ]; then httpx_input="subdomains/naabu.txt"; PORTS_ARG=(); fi
   fi
 
   if $HAVE_JQ; then
-    grun httpx httpx httpx -l "$httpx_input" "${PORTS_ARG[@]}" \
+    gtrun httpx httpx "$TMO_MED" httpx -l "$httpx_input" "${PORTS_ARG[@]}" \
         -threads "$HTTPX_THREADS" -fr -sc -title -td -server -cl -silent -nc \
         -json -o subdomains/live_hosts.jsonl
     if [ -s subdomains/live_hosts.jsonl ]; then
@@ -396,7 +434,7 @@ process_target() {
          subdomains/live_hosts.jsonl 2>/dev/null > subdomains/live_hosts.txt
     fi
   else
-    grun httpx httpx httpx -l "$httpx_input" "${PORTS_ARG[@]}" \
+    gtrun httpx httpx "$TMO_MED" httpx -l "$httpx_input" "${PORTS_ARG[@]}" \
         -threads "$HTTPX_THREADS" -fr -sc -title -server -cl -silent -nc \
         -o subdomains/live_hosts.txt
     awk '{print $1}' subdomains/live_hosts.txt 2>/dev/null | sort -u > subdomains/live_urls.txt
@@ -407,27 +445,27 @@ process_target() {
   # ------------------------------- FASE 3: SUBDOMAIN TAKEOVER ---------------
   if ! $NO_SUBS && have subzy; then
     step "FASE 3 · Comprobando subdomain takeover (subzy)"
-    run subzy bash -c "subzy run --targets subdomains/all_subs.txt --hide_fails > subdomains/takeover.txt 2>/dev/null"
+    trun subzy "$TMO_LIGHT" bash -c "subzy run --targets subdomains/all_subs.txt --hide_fails > subdomains/takeover.txt 2>/dev/null"
   fi
 
   # --------------------------- FASE 4: CRAWLING Y RECOLECCIÓN DE URLs -------
   step "FASE 4 · Crawling con Katana + wayback + gau"
   if [ -s subdomains/live_urls.txt ]; then
-    grun katana katana katana \
+    gtrun katana katana "$TMO_HEAVY" katana \
         -list subdomains/live_urls.txt \
         -d "$KATANA_DEPTH" \
         -jc -kf all \
         -ps -pss waybackarchive,commoncrawl,alienvault \
         -fs rdn \
         -c "$KATANA_C" -rl "$KATANA_RL" \
-        -timeout 10 -retry 2 -silent -nc \
+        -timeout 8 -retry 1 -silent -nc \
         -ef woff,woff2,css,png,svg,jpg,jpeg,gif,ico,ttf,eot \
         -o urls/katana.txt
   else
     warn "Sin hosts vivos; Katana se omite"
   fi
-  have waybackurls && run wayback bash -c "cat subdomains/resolved.txt | waybackurls > urls/wayback.txt"
-  have gau         && run gau     bash -c "cat subdomains/resolved.txt | gau --threads 5 > urls/gau.txt"
+  have waybackurls && trun wayback "$TMO_LIGHT" bash -c "cat subdomains/resolved.txt | waybackurls > urls/wayback.txt"
+  have gau         && trun gau     "$TMO_LIGHT" bash -c "cat subdomains/resolved.txt | gau --threads 5 > urls/gau.txt"
 
   cat urls/katana.txt urls/wayback.txt urls/gau.txt 2>/dev/null | sort -u > urls/all_urls.txt || true
   if have uro && [ -s urls/all_urls.txt ]; then
@@ -461,37 +499,37 @@ process_target() {
   # ----------------------------- FASE 6: ESCANEO DE VULNERABILIDADES --------
   step "FASE 6 · Escaneo de vulnerabilidades (nuclei + dalfox)"
   if [ -s subdomains/live_urls.txt ]; then
-    grun nuclei nuclei nuclei \
+    gtrun nuclei nuclei "$TMO_HEAVY" nuclei \
         -l subdomains/live_urls.txt \
         -severity critical,high,medium,low,info \
         -tags cve,misconfig,exposure,takeover,xss,sqli,ssrf,lfi,rce,default-login,redirect \
-        -rl "$NUCLEI_RL" -c "$NUCLEI_C" -timeout 10 -retries 2 -silent -stats \
+        -rl "$NUCLEI_RL" -c "$NUCLEI_C" -timeout 8 -retries 1 -silent -stats \
         -o vulns/nuclei_hosts.txt
   else
     warn "Sin hosts vivos; nuclei (hosts) se omite"
   fi
 
   if [ -s urls/all_urls_clean.txt ]; then
-    grun nuclei-urls nuclei nuclei \
+    gtrun nuclei-urls nuclei "$TMO_HEAVY" nuclei \
         -l urls/all_urls_clean.txt \
         -severity critical,high,medium,low \
         -tags cve,misconfig,exposure,xss,sqli,ssrf,lfi,rce,redirect,injection \
-        -rl "$NUCLEI_RL" -c "$NUCLEI_C" -timeout 10 -retries 2 -silent -stats \
+        -rl "$NUCLEI_RL" -c "$NUCLEI_C" -timeout 5 -retries 1 -silent -stats \
         -o vulns/nuclei_urls.txt
   fi
 
   cat urls/params/*.txt 2>/dev/null | sort -u > urls/params/_all_params.txt || true
   if [ -s urls/params/_all_params.txt ]; then
-    grun nuclei-params nuclei nuclei \
+    gtrun nuclei-params nuclei "$TMO_HEAVY" nuclei \
         -l urls/params/_all_params.txt \
         -severity critical,high,medium \
         -tags xss,sqli,ssrf,lfi,rce,redirect,injection \
-        -dast -rl "$NUCLEI_RL" -c "$NUCLEI_C" -silent \
+        -dast -rl "$NUCLEI_RL" -c "$NUCLEI_C" -timeout 5 -retries 1 -silent \
         -o vulns/nuclei_params.txt
   fi
 
   if have dalfox && [ -s urls/params/xss.txt ]; then
-    run dalfox dalfox file urls/params/xss.txt --silence --skip-bav --worker "$DALFOX_WORKERS" -o vulns/dalfox.txt
+    trun dalfox "$TMO_MED" dalfox file urls/params/xss.txt --silence --skip-bav --worker "$DALFOX_WORKERS" -o vulns/dalfox.txt
   fi
 
   cat vulns/nuclei_hosts.txt vulns/nuclei_urls.txt vulns/nuclei_params.txt 2>/dev/null | sort -u > vulns/nuclei_all.txt || true
@@ -594,8 +632,12 @@ main() {
 
   banner
   echo -e "${BOLD}Targets:${NC}    ${GREEN}${TARGETS[*]}${NC}"
-  echo -e "${BOLD}Intensidad:${NC} ${GREEN}${INTENSITY}${NC}   ${BOLD}Subdominios:${NC} ${GREEN}$([ "$NO_SUBS" = true ] && echo OFF || echo ON)${NC}"
+  echo -e "${BOLD}Intensidad:${NC} ${GREEN}${INTENSITY}${NC}   ${BOLD}Subdominios:${NC} ${GREEN}$([ "$NO_SUBS" = true ] && echo OFF || echo ON)${NC}   ${BOLD}Límite/fase:${NC} ${GREEN}$(( TMO_HEAVY / 60 )) min${NC}"
   echo -e "${BOLD}Salida:${NC}     ${GREEN}${BASE_OUTPUT}${NC}\n"
+
+  if ! have timeout; then
+    warn "'timeout' (coreutils) no disponible: las fases correrán SIN límite de tiempo."
+  fi
 
   ensure_tools
   HAVE_JQ=false; have jq && HAVE_JQ=true   # re-check tras posible instalación
