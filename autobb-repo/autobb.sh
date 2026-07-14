@@ -37,6 +37,8 @@ NO_SUBS=false
 AUTO_INSTALL=true                 # el usuario eligió: auto-instalar lo que falte
 INTENSITY="balanceado"            # conservador | balanceado | agresivo
 BASE_OUTPUT="$(pwd)/autobb_results"
+# Plantillas de fuzzing/DAST para nuclei (repo SEPARADO; NO se instala con -update-templates)
+FUZZ_TEMPLATES_DIR="${FUZZ_TEMPLATES_DIR:-$HOME/fuzzing-templates}"
 THREADS_OVERRIDE=""
 STALL_OVERRIDE=""                 # minutos de INACTIVIDAD antes de cortar una fase pesada colgada
 declare -a TARGETS=()
@@ -264,6 +266,16 @@ ensure_tools() {
     install_findomain
     setup_gf_patterns
     if have nuclei; then log "Actualizando plantillas de nuclei…"; nuclei -update-templates -silent >/dev/null 2>&1 || true; fi
+    # Fuzzing/DAST templates (repo aparte): imprescindibles para 'nuclei -dast' sobre parámetros
+    if have git; then
+      if [ ! -d "$FUZZ_TEMPLATES_DIR/.git" ]; then
+        log "Descargando fuzzing-templates (para nuclei -dast)…"
+        git clone -q https://github.com/projectdiscovery/fuzzing-templates "$FUZZ_TEMPLATES_DIR" 2>/dev/null \
+          && ok "fuzzing-templates listas" || warn "No se pudieron clonar fuzzing-templates"
+      else
+        git -C "$FUZZ_TEMPLATES_DIR" pull -q 2>/dev/null || true
+      fi
+    fi
   fi
 
   # refresca PATH por si acabamos de instalar
@@ -276,6 +288,18 @@ ensure_tools() {
   done
   ok "Disponibles: ${available[*]:-ninguna}"
   [ "${#missing[@]}" -gt 0 ] && warn "No disponibles (sus fases se omiten): ${missing[*]}"
+
+  # Sin plantillas, nuclei no reporta NADA (causa típica de "0 vulnerabilidades").
+  # Se verifica y, si faltan, se descargan aunque se haya usado --no-install.
+  if have nuclei; then
+    local tcount; tcount="$(nuclei -tl -silent 2>/dev/null | grep -c . || echo 0)"
+    if [ "${tcount:-0}" -lt 100 ]; then
+      warn "nuclei tiene pocas/ninguna plantilla (${tcount}). Descargando plantillas…"
+      nuclei -update-templates -silent >/dev/null 2>&1 || true
+      tcount="$(nuclei -tl -silent 2>/dev/null | grep -c . || echo 0)"
+    fi
+    ok "Plantillas de nuclei cargadas: ${tcount}"
+  fi
 
   have httpx || { err "httpx es imprescindible y no está disponible. Abortando."; exit 1; }
 }
@@ -500,7 +524,7 @@ process_target() {
   fi
 
   if $HAVE_JQ; then
-    gtrun httpx httpx "$TMO_MED" httpx -l "$httpx_input" "${PORTS_ARG[@]}" \
+    gtrun httpx httpx "$TMO_MED" httpx -l "$httpx_input" "${PORTS_ARG[@]+"${PORTS_ARG[@]}"}" \
         -threads "$HTTPX_THREADS" -fr -sc -title -td -server -cl -silent -nc \
         -json -o subdomains/live_hosts.jsonl
     if [ -s subdomains/live_hosts.jsonl ]; then
@@ -509,7 +533,7 @@ process_target() {
          subdomains/live_hosts.jsonl 2>/dev/null > subdomains/live_hosts.txt
     fi
   else
-    gtrun httpx httpx "$TMO_MED" httpx -l "$httpx_input" "${PORTS_ARG[@]}" \
+    gtrun httpx httpx "$TMO_MED" httpx -l "$httpx_input" "${PORTS_ARG[@]+"${PORTS_ARG[@]}"}" \
         -threads "$HTTPX_THREADS" -fr -sc -title -server -cl -silent -nc \
         -o subdomains/live_hosts.txt
     awk '{print $1}' subdomains/live_hosts.txt 2>/dev/null | sort -u > subdomains/live_urls.txt
@@ -582,10 +606,14 @@ process_target() {
   # ----------------------------- FASE 6: ESCANEO DE VULNERABILIDADES --------
   step "FASE 6 · Escaneo de vulnerabilidades (nuclei + dalfox)"
   if [ -s subdomains/live_urls.txt ]; then
+    # NOTA: se filtra SOLO por severidad. Antes se combinaba -tags + -severity y,
+    # como nuclei aplica los filtros con AND, esa lista de tags descartaba la
+    # mayoría de plantillas (de ahí los "0 hallazgos"). Sin -tags corren casi
+    # todas las plantillas de la comunidad (las intrusivas/DoS siguen excluidas
+    # por defecto). Reduce las severidades si quieres menos ruido.
     gwrun nuclei nuclei vulns/nuclei_hosts.txt "$STALL_HEAVY" nuclei \
         -l subdomains/live_urls.txt \
         -severity critical,high,medium,low,info \
-        -tags cve,misconfig,exposure,takeover,xss,sqli,ssrf,lfi,rce,default-login,redirect \
         -rl "$NUCLEI_RL" -c "$NUCLEI_C" -timeout 8 -retries 1 -silent -stats \
         -o vulns/nuclei_hosts.txt
   else
@@ -596,23 +624,34 @@ process_target() {
     gwrun nuclei-urls nuclei vulns/nuclei_urls.txt "$STALL_HEAVY" nuclei \
         -l urls/all_urls_clean.txt \
         -severity critical,high,medium,low \
-        -tags cve,misconfig,exposure,xss,sqli,ssrf,lfi,rce,redirect,injection \
         -rl "$NUCLEI_RL" -c "$NUCLEI_C" -timeout 5 -retries 1 -silent -stats \
         -o vulns/nuclei_urls.txt
   fi
 
   cat urls/params/*.txt 2>/dev/null | sort -u > urls/params/_all_params.txt || true
   if [ -s urls/params/_all_params.txt ]; then
-    gwrun nuclei-params nuclei vulns/nuclei_params.txt "$STALL_HEAVY" nuclei \
-        -l urls/params/_all_params.txt \
-        -severity critical,high,medium \
-        -tags xss,sqli,ssrf,lfi,rce,redirect,injection \
-        -dast -rl "$NUCLEI_RL" -c "$NUCLEI_C" -timeout 5 -retries 1 -silent -stats \
-        -o vulns/nuclei_params.txt
+    # DAST/fuzzing de parámetros. Requiere el repo 'fuzzing-templates' (aparte) y
+    # el flag -dast. Antes esta fase pasaba -dast pero SIN cargar esas plantillas,
+    # así que no probaba absolutamente nada. Ahora se apuntan explícitamente.
+    if [ -d "$FUZZ_TEMPLATES_DIR" ] && [ -n "$(ls -A "$FUZZ_TEMPLATES_DIR" 2>/dev/null)" ]; then
+      gwrun nuclei-params nuclei vulns/nuclei_params.txt "$STALL_HEAVY" nuclei \
+          -l urls/params/_all_params.txt \
+          -t "$FUZZ_TEMPLATES_DIR" -dast \
+          -severity critical,high,medium,low \
+          -rl "$NUCLEI_RL" -c "$NUCLEI_C" -timeout 5 -retries 1 -silent -stats \
+          -o vulns/nuclei_params.txt
+    else
+      warn "Plantillas de fuzzing (DAST) no disponibles → 'nuclei -dast' se omite. Clónalas con: git clone https://github.com/projectdiscovery/fuzzing-templates \"$FUZZ_TEMPLATES_DIR\"  (para XSS se usa dalfox)."
+    fi
   fi
 
-  if have dalfox && [ -s urls/params/xss.txt ]; then
-    trun dalfox "$TMO_MED" dalfox file urls/params/xss.txt --silence --skip-bav --worker "$DALFOX_WORKERS" -o vulns/dalfox.txt
+  if have dalfox; then
+    # Si gf no generó xss.txt (patrones ausentes), recae en la lista de params interesantes.
+    local dalfox_in="urls/params/xss.txt"
+    [ -s "$dalfox_in" ] || dalfox_in="urls/params/interesting.txt"
+    if [ -s "$dalfox_in" ]; then
+      trun dalfox "$TMO_MED" dalfox file "$dalfox_in" --silence --skip-bav --worker "$DALFOX_WORKERS" -o vulns/dalfox.txt
+    fi
   fi
 
   cat vulns/nuclei_hosts.txt vulns/nuclei_urls.txt vulns/nuclei_params.txt 2>/dev/null | sort -u > vulns/nuclei_all.txt || true
