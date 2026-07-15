@@ -39,6 +39,8 @@ INTENSITY="balanceado"            # conservador | balanceado | agresivo
 BASE_OUTPUT="$(pwd)/autobb_results"
 # Plantillas de fuzzing/DAST para nuclei (repo SEPARADO; NO se instala con -update-templates)
 FUZZ_TEMPLATES_DIR="${FUZZ_TEMPLATES_DIR:-$HOME/fuzzing-templates}"
+# Wordlist para fuerza bruta de directorios/endpoints (ffuf)
+DIRB_WORDLIST="${DIRB_WORDLIST:-$HOME/.autobb_wordlists/common.txt}"
 THREADS_OVERRIDE=""
 STALL_OVERRIDE=""                 # minutos de INACTIVIDAD antes de cortar una fase pesada colgada
 declare -a TARGETS=()
@@ -143,9 +145,9 @@ parse_args() {
 # ------------------------------------------------------- AJUSTES INTENSIDAD --
 set_intensity() {
   case "$INTENSITY" in
-    conservador) HTTPX_THREADS=50;  NUCLEI_RL=30;  NUCLEI_C=25;  KATANA_C=10; KATANA_DEPTH=2; KATANA_RL=50;  NAABU_RATE=500;  DALFOX_WORKERS=10 ;;
-    balanceado)  HTTPX_THREADS=100; NUCLEI_RL=100; NUCLEI_C=50;  KATANA_C=25; KATANA_DEPTH=3; KATANA_RL=150; NAABU_RATE=1000; DALFOX_WORKERS=25 ;;
-    agresivo)    HTTPX_THREADS=200; NUCLEI_RL=300; NUCLEI_C=100; KATANA_C=50; KATANA_DEPTH=5; KATANA_RL=300; NAABU_RATE=3000; DALFOX_WORKERS=40 ;;
+    conservador) HTTPX_THREADS=50;  NUCLEI_RL=30;  NUCLEI_C=25;  KATANA_C=10; KATANA_DEPTH=2; KATANA_RL=50;  NAABU_RATE=500;  DALFOX_WORKERS=10; FFUF_THREADS=20 ;;
+    balanceado)  HTTPX_THREADS=100; NUCLEI_RL=100; NUCLEI_C=50;  KATANA_C=25; KATANA_DEPTH=3; KATANA_RL=150; NAABU_RATE=1000; DALFOX_WORKERS=25; FFUF_THREADS=40 ;;
+    agresivo)    HTTPX_THREADS=200; NUCLEI_RL=300; NUCLEI_C=100; KATANA_C=50; KATANA_DEPTH=5; KATANA_RL=300; NAABU_RATE=3000; DALFOX_WORKERS=40; FFUF_THREADS=60 ;;
   esac
   if [ -n "$THREADS_OVERRIDE" ]; then
     HTTPX_THREADS="$THREADS_OVERRIDE"; NUCLEI_C="$THREADS_OVERRIDE"; KATANA_C="$THREADS_OVERRIDE"
@@ -175,6 +177,7 @@ declare -A GO_TOOLS=(
   [httpx]="github.com/projectdiscovery/httpx/cmd/httpx@latest"
   [dnsx]="github.com/projectdiscovery/dnsx/cmd/dnsx@latest"
   [naabu]="github.com/projectdiscovery/naabu/v2/cmd/naabu@latest"
+  [ffuf]="github.com/ffuf/ffuf/v2@latest"
   [nuclei]="github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest"
   [katana]="github.com/projectdiscovery/katana/cmd/katana@latest"
   [assetfinder]="github.com/tomnomnom/assetfinder@latest"
@@ -276,6 +279,13 @@ ensure_tools() {
         git -C "$FUZZ_TEMPLATES_DIR" pull -q 2>/dev/null || true
       fi
     fi
+    # Wordlist para fuerza bruta de directorios (ffuf). Solo se descarga si falta.
+    if [ ! -s "$DIRB_WORDLIST" ]; then
+      log "Descargando wordlist de directorios…"
+      mkdir -p "$(dirname "$DIRB_WORDLIST")"
+      curl -sL "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/common.txt" -o "$DIRB_WORDLIST" 2>/dev/null \
+        && ok "Wordlist lista ($(count_lines "$DIRB_WORDLIST") entradas)" || warn "No se pudo descargar la wordlist (ffuf se omitirá)"
+    fi
   fi
 
   # refresca PATH por si acabamos de instalar
@@ -283,7 +293,7 @@ ensure_tools() {
 
   # informe de disponibilidad
   local t available=() missing=()
-  for t in subfinder assetfinder findomain subdominator sublist3r dnsx naabu httpx katana waybackurls gau gf uro qsreplace anew nuclei dalfox subzy jq; do
+  for t in subfinder assetfinder findomain subdominator sublist3r dnsx naabu httpx katana ffuf waybackurls gau gf uro qsreplace anew nuclei dalfox subzy jq; do
     if have "$t"; then available+=("$t"); else missing+=("$t"); fi
   done
   ok "Disponibles: ${available[*]:-ninguna}"
@@ -360,26 +370,22 @@ sanitize_target() {                    # deja solo el host
   printf '%s' "$t"
 }
 
-# Filtra un fichero de URLs dejando SOLO las que están dentro del scope.
-#   --no-subs : únicamente los hosts exactos de subdomains/all_subs.txt
-#   normal    : el dominio objetivo y sus subdominios (host == target o *.target)
-# Usa la variable $target y $NO_SUBS del contexto de process_target.
+# Filtra un fichero de URLs/hosts dejando SOLO lo que está dentro del scope.
+# Scope = el dominio objetivo y TODOS sus subdominios (host == target o *.target).
+#
+# IMPORTANTE: antes, con --no-subs, se exigía coincidencia EXACTA con el apex y
+# se descartaban las URLs de www.* y de cualquier subdominio → daba "0 en scope"
+# aunque wayback/gau/katana hubieran encontrado decenas de URLs válidas. Ahora
+# --no-subs solo afecta a la ENUMERACIÓN de subdominios, no al scope de las URLs.
 in_scope_filter() {
   local infile="$1" outfile="$2"
   if [ ! -s "$infile" ]; then : > "$outfile"; return; fi
-  if $NO_SUBS; then
-    awk -v hosts="$(paste -sd, subdomains/all_subs.txt 2>/dev/null)" '
-      BEGIN { n = split(hosts, a, ","); for (i = 1; i <= n; i++) ok[a[i]] = 1 }
-      { u = $0; sub(/^[a-zA-Z]+:\/\//, "", u); sub(/[\/?#].*$/, "", u); sub(/:.*/, "", u)
-        if (u in ok) print $0 }
-    ' "$infile" > "$outfile"
-  else
-    awk -v t="$target" '
-      BEGIN { esc = t; gsub(/\./, "\\.", esc) }
-      { u = $0; sub(/^[a-zA-Z]+:\/\//, "", u); sub(/[\/?#].*$/, "", u); sub(/:.*/, "", u)
-        if (u == t || u ~ ("\\." esc "$")) print $0 }
-    ' "$infile" > "$outfile"
-  fi
+  awk -v t="$target" '
+    BEGIN { t = tolower(t); esc = t; gsub(/\./, "\\.", esc) }
+    { u = $0; sub(/^[a-zA-Z]+:\/\//, "", u); sub(/[\/?#].*$/, "", u); sub(/:.*/, "", u)
+      u = tolower(u)
+      if (u == t || u ~ ("\\." esc "$")) print $0 }
+  ' "$infile" > "$outfile"
 }
 
 # Ejecuta un comando registrando su salida en logs/<name>.log
@@ -506,8 +512,12 @@ process_target() {
     grep -qxF "$target" subdomains/all_subs.txt 2>/dev/null || echo "$target" >> subdomains/all_subs.txt
     sort -u -o subdomains/all_subs.txt subdomains/all_subs.txt
   fi
+  # Semilla extra: añade www.<target> como candidato. Muchos sitios sirven en www
+  # y no en el apex; es barato y evita perder el host real cuando el apex no responde.
+  grep -qxF "www.${target}" subdomains/all_subs.txt 2>/dev/null || echo "www.${target}" >> subdomains/all_subs.txt
+  sort -u -o subdomains/all_subs.txt subdomains/all_subs.txt
   local n_subs; n_subs="$(count_lines subdomains/all_subs.txt)"
-  ok "Subdominios únicos: ${BOLD}${n_subs}${NC}"
+  ok "Subdominios/candidatos: ${BOLD}${n_subs}${NC}"
 
   # -------------------------------- FASE 2: RESOLUCIÓN Y HOSTS VIVOS --------
   step "FASE 2 · Resolución DNS y detección de hosts vivos"
@@ -547,10 +557,50 @@ process_target() {
     trun subzy "$TMO_LIGHT" bash -c "subzy run --targets subdomains/all_subs.txt --hide_fails > subdomains/takeover.txt 2>/dev/null"
   fi
 
-  # --------------------------- FASE 4: CRAWLING Y RECOLECCIÓN DE URLs -------
-  step "FASE 4 · Crawling con Katana + wayback + gau"
-  # Scope de Katana: con --no-subs, solo el host exacto (fqdn); si no, el
-  # dominio raíz y sus subdominios (rdn).
+  # --------------------------- FASE 4: RECOLECCIÓN DE URLs / ENDPOINTS ------
+  # Objetivo: reunir TODAS las URLs, directorios y endpoints EN SCOPE en un solo
+  # fichero (urls/all_urls_clean.txt) que luego lee nuclei. Estrategia robusta y
+  # con RETROALIMENTACIÓN, para no depender de que el apex esté vivo ni de katana:
+  #   4a) Fuentes pasivas (wayback + gau): funcionan aunque no haya hosts vivos.
+  #   4b) FEEDBACK: se extraen los hosts EN SCOPE de esas URLs, se prueban con
+  #       httpx y los vivos se AÑADEN a live_urls (rescata www.* y subdominios).
+  #   4c) Katana (crawl activo) sobre los hosts vivos ya ampliados.
+  #   4d) Fuerza bruta de directorios (ffuf): cubre lo que katana no ve o si falla.
+  step "FASE 4 · Recolección de URLs, directorios y endpoints"
+
+  # 4a) Fuentes pasivas (sobre TODOS los candidatos resueltos) -----------------
+  have waybackurls && trun wayback "$TMO_LIGHT" bash -c "cat subdomains/resolved.txt | waybackurls > urls/wayback.txt"
+  have gau         && trun gau     "$TMO_LIGHT" bash -c "cat subdomains/resolved.txt | gau --threads 5 > urls/gau.txt"
+
+  # 4b) FEEDBACK: hosts en scope hallados en las pasivas → probar → añadir a live
+  cat urls/wayback.txt urls/gau.txt 2>/dev/null \
+    | sed -E 's#^[a-zA-Z]+://##; s#[/?#].*$##; s#:.*$##' \
+    | tr '[:upper:]' '[:lower:]' | sort -u > urls/_passive_hosts.txt || true
+  in_scope_filter urls/_passive_hosts.txt urls/_passive_hosts_scope.txt
+  cat subdomains/resolved.txt urls/_passive_hosts_scope.txt 2>/dev/null | sort -u > urls/_probe_hosts.txt || true
+  if [ -s urls/_probe_hosts.txt ]; then
+    log "Feedback: reprobando $(count_lines urls/_probe_hosts.txt) host(s) en scope con httpx…"
+    if $HAVE_JQ; then
+      gtrun httpx-fb httpx "$TMO_MED" httpx -l urls/_probe_hosts.txt \
+          -threads "$HTTPX_THREADS" -fr -sc -title -td -server -cl -silent -nc \
+          -json -o subdomains/live_hosts_fb.jsonl
+      if [ -s subdomains/live_hosts_fb.jsonl ]; then
+        cat subdomains/live_hosts_fb.jsonl >> subdomains/live_hosts.jsonl 2>/dev/null || true
+        jq -r '.url' subdomains/live_hosts_fb.jsonl 2>/dev/null >> subdomains/live_urls.txt
+      fi
+    else
+      gtrun httpx-fb httpx "$TMO_MED" httpx -l urls/_probe_hosts.txt \
+          -threads "$HTTPX_THREADS" -fr -sc -title -server -cl -silent -nc \
+          -o subdomains/live_hosts_fb.txt
+      [ -s subdomains/live_hosts_fb.txt ] && awk '{print $1}' subdomains/live_hosts_fb.txt >> subdomains/live_urls.txt
+    fi
+    sort -u -o subdomains/live_urls.txt subdomains/live_urls.txt 2>/dev/null || true
+  fi
+  n_live="$(count_lines subdomains/live_urls.txt)"
+  ok "Hosts vivos tras feedback: ${BOLD}${n_live}${NC}"
+
+  # 4c) Katana (crawl activo) sobre los hosts vivos ----------------------------
+  # Scope de Katana: con --no-subs, host exacto (fqdn); si no, dominio+subs (rdn).
   local katana_scope="rdn"; $NO_SUBS && katana_scope="fqdn"
   if [ -s subdomains/live_urls.txt ]; then
     gwrun katana katana urls/katana.txt "$STALL_HEAVY" katana \
@@ -563,25 +613,56 @@ process_target() {
         -timeout 8 -retry 1 -silent -nc \
         -ef woff,woff2,css,png,svg,jpg,jpeg,gif,ico,ttf,eot \
         -o urls/katana.txt
+    [ -s urls/katana.txt ] || warn "Katana no devolvió URLs (se continúa con pasivas + ffuf)"
   else
-    warn "Sin hosts vivos; Katana se omite"
+    warn "Sin hosts vivos; Katana se omite (se usan pasivas + ffuf si aplica)"
   fi
-  have waybackurls && trun wayback "$TMO_LIGHT" bash -c "cat subdomains/resolved.txt | waybackurls > urls/wayback.txt"
-  have gau         && trun gau     "$TMO_LIGHT" bash -c "cat subdomains/resolved.txt | gau --threads 5 > urls/gau.txt"
 
-  cat urls/katana.txt urls/wayback.txt urls/gau.txt 2>/dev/null | sort -u > urls/all_urls.txt || true
+  # 4d) Fuerza bruta de directorios/endpoints con ffuf sobre cada host vivo -----
+  : > urls/ffuf.txt
+  if have ffuf && [ -s subdomains/live_urls.txt ] && [ -s "$DIRB_WORDLIST" ]; then
+    local root ftmp label
+    while IFS= read -r root; do
+      [ -n "$root" ] || continue
+      ftmp="$(mktemp)"
+      label="ffuf_$(printf '%s' "$root" | tr -c 'a-zA-Z0-9' '_')"
+      trun "$label" "$TMO_MED" \
+        ffuf -u "${root%/}/FUZZ" -w "$DIRB_WORDLIST" \
+             -mc 200,201,202,204,301,302,307,308,401,403,405,500 \
+             -t "$FFUF_THREADS" -rate "$KATANA_RL" -timeout 8 -ac -s \
+             -of json -o "$ftmp"
+      if [ -s "$ftmp" ] && $HAVE_JQ; then
+        jq -r '.results[]?.url' "$ftmp" 2>/dev/null >> urls/ffuf.txt
+      fi
+      rm -f "$ftmp"
+    done < subdomains/live_urls.txt
+    sort -u -o urls/ffuf.txt urls/ffuf.txt 2>/dev/null || true
+    ok "ffuf: ${BOLD}$(count_lines urls/ffuf.txt)${NC} rutas/endpoints encontrados"
+  elif ! have ffuf; then
+    warn "ffuf no disponible → fuerza bruta de directorios omitida (instálalo para más cobertura)"
+  elif [ ! -s "$DIRB_WORDLIST" ]; then
+    warn "Wordlist no disponible ($DIRB_WORDLIST) → ffuf omitido"
+  fi
+
+  # --- Consolidación: katana + wayback + gau + ffuf + raíces vivas ------------
+  cat urls/katana.txt urls/wayback.txt urls/gau.txt urls/ffuf.txt subdomains/live_urls.txt 2>/dev/null \
+    | sort -u > urls/all_urls.txt || true
   if have uro && [ -s urls/all_urls.txt ]; then
     uro -i urls/all_urls.txt -o urls/all_urls_raw.txt 2>/dev/null || cp urls/all_urls.txt urls/all_urls_raw.txt
   else
     cp urls/all_urls.txt urls/all_urls_raw.txt 2>/dev/null || : > urls/all_urls_raw.txt
   fi
-  # Filtro de SCOPE: descarta cualquier URL fuera del objetivo antes de escanear
+  # Filtro de SCOPE (dominio objetivo + subdominios)
   in_scope_filter urls/all_urls_raw.txt urls/all_urls_clean.txt
+  # Garantiza que las raíces vivas SIEMPRE estén en el set que verá nuclei
+  cat subdomains/live_urls.txt >> urls/all_urls_clean.txt 2>/dev/null || true
+  sort -u -o urls/all_urls_clean.txt urls/all_urls_clean.txt 2>/dev/null || true
+
   local n_raw n_urls n_off
   n_raw="$(count_lines urls/all_urls_raw.txt)"
   n_urls="$(count_lines urls/all_urls_clean.txt)"
-  n_off=$(( n_raw - n_urls ))
-  ok "URLs recolectadas: ${BOLD}${n_raw}${NC} · en scope: ${BOLD}${n_urls}${NC} · descartadas fuera de scope: ${BOLD}${n_off}${NC}"
+  n_off=$(( n_raw - n_urls )); [ "$n_off" -lt 0 ] && n_off=0
+  ok "URLs recolectadas: ${BOLD}${n_raw}${NC} · EN SCOPE (a escanear): ${BOLD}${n_urls}${NC} · fuera de scope: ${BOLD}${n_off}${NC}"
 
   # ------------------------- FASE 5: FILTRADO SENSIBLE / PARÁMETROS ---------
   step "FASE 5 · Archivos sensibles y parámetros interesantes"
