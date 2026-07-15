@@ -28,6 +28,7 @@ BLUE='\033[0;34m'; CYAN='\033[0;36m'; MAGENTA='\033[0;35m'; BOLD='\033[1m'; NC='
 
 # --------------------------------------------------------------- VARIABLES ---
 SCRIPT_NAME="$(basename "$0")"
+SCRIPT_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"; SCRIPT_DIR="${SCRIPT_DIR:-$(pwd)}"
 RUN_TS="$(date +%Y%m%d_%H%M%S)"
 RUN_START_EPOCH="$(date +%s)"
 START_PWD="$(pwd)"
@@ -41,6 +42,15 @@ BASE_OUTPUT="$(pwd)/autobb_results"
 FUZZ_TEMPLATES_DIR="${FUZZ_TEMPLATES_DIR:-$HOME/fuzzing-templates}"
 # Wordlist para fuerza bruta de directorios/endpoints (ffuf)
 DIRB_WORDLIST="${DIRB_WORDLIST:-$HOME/.autobb_wordlists/common.txt}"
+# --- Plantillas de nuclei (propias del usuario) ------------------------------
+USER_TEMPLATES=""                 # rutas (coma-sep) pasadas con --templates
+EXCLUDE_TEMPLATES=""              # rutas (coma-sep) pasadas con --exclude-templates
+ONLY_CUSTOM=false                 # --only-custom: solo plantillas custom (sin comunidad)
+NO_CUSTOM_PACK=false              # --no-custom-pack: no auto-incluir el pack propio
+# Pack de plantillas que acompaña al script (si existe junto a autobb.sh)
+CUSTOM_PACK_DIR="${AUTOBB_CUSTOM_TEMPLATES:-$SCRIPT_DIR/custom-templates}"
+declare -a NUCLEI_CUSTOM_ARGS=()
+HAVE_CUSTOM_TPL=false
 THREADS_OVERRIDE=""
 STALL_OVERRIDE=""                 # minutos de INACTIVIDAD antes de cortar una fase pesada colgada
 declare -a TARGETS=()
@@ -99,6 +109,11 @@ OPCIONES:
   --stall-timeout <min> Cortar katana/nuclei solo si se cuelgan (min sin actividad; def: 15)
   --output <dir>        Directorio base de resultados (def: ./autobb_results)
   --no-install          No intentar instalar herramientas que falten
+  --templates <paths>   Plantillas nuclei propias (fichero/dir, coma-sep). Se suman
+                        a las de la comunidad y corren contra TODAS las URLs en scope.
+  --only-custom         Ejecutar SOLO tus plantillas (omite el set de la comunidad)
+  --exclude-templates <paths>  Excluir plantillas/dirs de nuclei (coma-sep)
+  --no-custom-pack      No incluir el pack de plantillas que viene con el script
   -h, --help            Muestra esta ayuda
 
 NOTIFICACIONES (por variable de entorno o ~/.autobb.conf):
@@ -123,6 +138,10 @@ parse_args() {
       --stall-timeout) STALL_OVERRIDE="${2:-}"; shift 2 ;;
       --output)      BASE_OUTPUT="${2:-}"; shift 2 ;;
       --no-install)  AUTO_INSTALL=false; shift ;;
+      -t|--templates)          USER_TEMPLATES="${2:-}"; shift 2 ;;
+      --only-custom)           ONLY_CUSTOM=true; shift ;;
+      -et|--exclude-templates) EXCLUDE_TEMPLATES="${2:-}"; shift 2 ;;
+      --no-custom-pack)        NO_CUSTOM_PACK=true; shift ;;
       -h|--help)     usage; exit 0 ;;
       --*)           err "Opción desconocida: $1"; usage; exit 1 ;;
       *)             TARGETS+=("$1"); shift ;;
@@ -476,6 +495,43 @@ gwrun() {
 }
 
 # ============================================================================
+#  PLANTILLAS CUSTOM DE NUCLEI
+# ============================================================================
+# Construye NUCLEI_CUSTOM_ARGS (-t/-et) a partir de:
+#   - el pack que acompaña al script ($CUSTOM_PACK_DIR), salvo --no-custom-pack
+#   - las rutas de --templates
+#   - exclusiones de --exclude-templates
+# Estas plantillas se ejecutan en una PASADA DEDICADA, SIN filtro de severidad,
+# para que corran TODAS (incluidas las 'info') contra todas las URLs en scope.
+build_nuclei_custom_args() {
+  NUCLEI_CUSTOM_ARGS=(); HAVE_CUSTOM_TPL=false
+  local -a customs=(); local c e p
+  if ! $NO_CUSTOM_PACK && [ -d "$CUSTOM_PACK_DIR" ] && [ -n "$(ls -A "$CUSTOM_PACK_DIR" 2>/dev/null)" ]; then
+    customs+=("$CUSTOM_PACK_DIR")
+  fi
+  if [ -n "$USER_TEMPLATES" ]; then
+    local IFS=','
+    for p in $USER_TEMPLATES; do [ -n "$p" ] && customs+=("$p"); done
+  fi
+  for c in "${customs[@]:-}"; do
+    [ -n "$c" ] || continue
+    if [ -e "$c" ]; then NUCLEI_CUSTOM_ARGS+=(-t "$c"); HAVE_CUSTOM_TPL=true
+    else warn "Plantilla/dir no encontrado, se ignora: $c"; fi
+  done
+  if [ -n "$EXCLUDE_TEMPLATES" ]; then
+    local IFS=','
+    for e in $EXCLUDE_TEMPLATES; do [ -n "$e" ] && NUCLEI_CUSTOM_ARGS+=(-et "$e"); done
+  fi
+  if $ONLY_CUSTOM && ! $HAVE_CUSTOM_TPL; then
+    warn "--only-custom pero no hay plantillas custom válidas → se usa el set de la comunidad."
+    ONLY_CUSTOM=false
+  fi
+  if $HAVE_CUSTOM_TPL; then
+    ok "Plantillas custom activas$( $ONLY_CUSTOM && echo ' (SOLO custom)')"
+  fi
+}
+
+# ============================================================================
 #  PROCESADO DE UN TARGET
 # ============================================================================
 process_target() {
@@ -686,7 +742,7 @@ process_target() {
 
   # ----------------------------- FASE 6: ESCANEO DE VULNERABILIDADES --------
   step "FASE 6 · Escaneo de vulnerabilidades (nuclei + dalfox)"
-  if [ -s subdomains/live_urls.txt ]; then
+  if ! $ONLY_CUSTOM && [ -s subdomains/live_urls.txt ]; then
     # NOTA: se filtra SOLO por severidad. Antes se combinaba -tags + -severity y,
     # como nuclei aplica los filtros con AND, esa lista de tags descartaba la
     # mayoría de plantillas (de ahí los "0 hallazgos"). Sin -tags corren casi
@@ -697,16 +753,29 @@ process_target() {
         -severity critical,high,medium,low,info \
         -rl "$NUCLEI_RL" -c "$NUCLEI_C" -timeout 8 -retries 1 -silent -stats \
         -o vulns/nuclei_hosts.txt
+  elif $ONLY_CUSTOM; then
+    warn "--only-custom activo; se omiten las plantillas de la comunidad (hosts)"
   else
     warn "Sin hosts vivos; nuclei (hosts) se omite"
   fi
 
-  if [ -s urls/all_urls_clean.txt ]; then
+  if ! $ONLY_CUSTOM && [ -s urls/all_urls_clean.txt ]; then
     gwrun nuclei-urls nuclei vulns/nuclei_urls.txt "$STALL_HEAVY" nuclei \
         -l urls/all_urls_clean.txt \
         -severity critical,high,medium,low \
         -rl "$NUCLEI_RL" -c "$NUCLEI_C" -timeout 5 -retries 1 -silent -stats \
         -o vulns/nuclei_urls.txt
+  fi
+
+  # --- PASADA DEDICADA: TUS plantillas (pack + --templates) ------------------
+  # Sin filtro de severidad → corren TODAS tus plantillas contra todas las URLs
+  # en scope (el fichero all_urls_clean.txt incluye raíces vivas + endpoints).
+  if $HAVE_CUSTOM_TPL && [ -s urls/all_urls_clean.txt ]; then
+    gwrun nuclei-custom nuclei vulns/nuclei_custom.txt "$STALL_HEAVY" nuclei \
+        -l urls/all_urls_clean.txt \
+        "${NUCLEI_CUSTOM_ARGS[@]}" \
+        -rl "$NUCLEI_RL" -c "$NUCLEI_C" -timeout 8 -retries 1 -silent -stats \
+        -o vulns/nuclei_custom.txt
   fi
 
   cat urls/params/*.txt 2>/dev/null | sort -u > urls/params/_all_params.txt || true
@@ -735,7 +804,7 @@ process_target() {
     fi
   fi
 
-  cat vulns/nuclei_hosts.txt vulns/nuclei_urls.txt vulns/nuclei_params.txt 2>/dev/null | sort -u > vulns/nuclei_all.txt || true
+  cat vulns/nuclei_hosts.txt vulns/nuclei_urls.txt vulns/nuclei_params.txt vulns/nuclei_custom.txt 2>/dev/null | sort -u > vulns/nuclei_all.txt || true
 
   # recuento de severidades
   local c_crit c_high c_med c_low c_info n_take n_dalfox
@@ -844,6 +913,7 @@ main() {
 
   ensure_tools
   HAVE_JQ=false; have jq && HAVE_JQ=true   # re-check tras posible instalación
+  build_nuclei_custom_args
 
   # estado de notificaciones
   if [ -z "$DISCORD_WEBHOOK_URL" ] && { [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; }; then
