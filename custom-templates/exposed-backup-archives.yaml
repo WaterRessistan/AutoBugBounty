@@ -1,0 +1,38 @@
+id: autobb-exposed-backup-archives
+
+info:
+  name: Exposed Backup Archive (zip/gzip/rar/7z)
+  author: autobb
+  severity: high
+  description: >
+    Detects common backup filenames left in the webroot that actually return
+    a real archive (verified via magic bytes), not a generic HTML error page
+    that happens to return 200 on unknown paths.
+  tags: autobb,exposure,backup,misconfig
+
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}/backup.zip"
+      - "{{BaseURL}}/backup.tar.gz"
+      - "{{BaseURL}}/site-backup.zip"
+      - "{{BaseURL}}/www-backup.tar.gz"
+      - "{{BaseURL}}/backup.rar"
+      - "{{BaseURL}}/backup.7z"
+      - "{{BaseURL}}/website.zip"
+      - "{{BaseURL}}/www.zip"
+
+    matchers-condition: and
+    matchers:
+      - type: status
+        status:
+          - 200
+
+      - type: binary
+        part: body
+        condition: or
+        words:
+          - "504b0304"        # zip (PK..)
+          - "1f8b08"          # gzip
+          - "526172211a0700"  # rar5
+          - "377abcaf271c"    # 7z

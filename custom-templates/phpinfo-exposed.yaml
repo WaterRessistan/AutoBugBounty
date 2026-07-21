@@ -1,0 +1,33 @@
+id: autobb-phpinfo-exposed
+
+info:
+  name: Exposed phpinfo() Output
+  author: autobb
+  severity: medium
+  description: >
+    Detects publicly accessible phpinfo() pages, which leak server paths,
+    installed extensions, environment variables and sometimes credentials.
+  tags: autobb,exposure,php,misconfig
+
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}/phpinfo.php"
+      - "{{BaseURL}}/info.php"
+      - "{{BaseURL}}/test.php"
+      - "{{BaseURL}}/i.php"
+      - "{{BaseURL}}/php_info.php"
+      - "{{BaseURL}}/_phpinfo.php"
+
+    matchers-condition: and
+    matchers:
+      - type: status
+        status:
+          - 200
+
+      - type: word
+        part: body
+        condition: and
+        words:
+          - "phpinfo()"
+          - "PHP Version"

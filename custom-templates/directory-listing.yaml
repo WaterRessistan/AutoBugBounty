@@ -1,0 +1,30 @@
+id: autobb-directory-listing
+
+info:
+  name: Directory Listing / Autoindex Enabled
+  author: autobb
+  severity: low
+  description: >
+    Detects autoindex/directory listing pages (Apache/nginx/IIS style),
+    which can expose files not meant to be browsable.
+  tags: autobb,exposure,misconfig
+
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}"
+
+    matchers-condition: and
+    matchers:
+      - type: status
+        status:
+          - 200
+
+      - type: word
+        part: body
+        condition: or
+        words:
+          - "Index of /"
+          - "<title>Directory listing for"
+          - "- /</title>"
+          - "[To Parent Directory]"

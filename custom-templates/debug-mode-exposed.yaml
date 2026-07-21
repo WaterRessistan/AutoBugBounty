@@ -1,0 +1,42 @@
+id: autobb-debug-mode-exposed
+
+info:
+  name: Framework Debug Mode Enabled (Stack Trace Disclosure)
+  author: autobb
+  severity: high
+  description: >
+    Detects Laravel (APP_DEBUG=true) or Django (DEBUG=True) debug error
+    pages that leak stack traces, source snippets, file paths, and
+    sometimes environment variables/config values.
+  tags: autobb,exposure,debug,misconfig
+
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}"
+
+    matchers-condition: or
+    matchers:
+      - type: word
+        part: body
+        name: laravel-debug
+        condition: and
+        words:
+          - "Illuminate\\"
+          - "Stack trace"
+
+      - type: word
+        part: body
+        name: django-debug
+        condition: and
+        words:
+          - "You're seeing this error because you have"
+          - "DEBUG = True"
+
+      - type: word
+        part: body
+        name: symfony-debug
+        condition: and
+        words:
+          - "Symfony\\Component\\Debug"
+          - "Stack Trace"

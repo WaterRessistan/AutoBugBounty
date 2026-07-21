@@ -1,0 +1,51 @@
+id: autobb-exposed-env-file
+
+info:
+  name: Exposed .env File with Credentials
+  author: autobb
+  severity: high
+  description: >
+    Detects a publicly accessible .env file containing application secrets
+    (DB credentials, API keys, app key). Matching requires plain-text env-style
+    content, not just a 200 status, to avoid soft-404/catch-all false positives.
+  tags: autobb,exposure,env,config
+
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}/.env"
+      - "{{BaseURL}}/.env.local"
+      - "{{BaseURL}}/.env.production"
+      - "{{BaseURL}}/.env.backup"
+      - "{{BaseURL}}/api/.env"
+
+    matchers-condition: and
+    matchers:
+      - type: status
+        status:
+          - 200
+
+      - type: word
+        part: body
+        condition: or
+        words:
+          - "APP_KEY="
+          - "DB_PASSWORD="
+          - "DB_HOST="
+          - "DB_CONNECTION="
+          - "AWS_SECRET_ACCESS_KEY="
+          - "MAIL_PASSWORD="
+          - "SECRET_KEY_BASE="
+
+      - type: word
+        part: body
+        negative: true
+        words:
+          - "<html"
+          - "<!DOCTYPE"
+
+      - type: word
+        part: header
+        negative: true
+        words:
+          - "text/html"

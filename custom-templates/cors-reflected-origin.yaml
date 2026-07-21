@@ -1,0 +1,37 @@
+id: autobb-cors-reflected-origin
+
+info:
+  name: Exploitable CORS Misconfiguration (Reflected Origin + Credentials)
+  author: autobb
+  severity: medium
+  description: >
+    Sends a distinctive, attacker-controlled Origin header and only fires if
+    the server reflects that EXACT origin back AND sets
+    Access-Control-Allow-Credentials: true. A wildcard ACAO ("*") is NOT
+    exploitable together with credentials (browsers block that combination),
+    so this deliberately does not flag that common, benign case.
+  tags: autobb,cors,misconfig
+
+variables:
+  rnd: "{{randstr}}"
+
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}"
+    headers:
+      Origin: "https://{{rnd}}.autobb-cors-check.invalid"
+
+    matchers-condition: and
+    matchers:
+      - type: word
+        part: header
+        case-insensitive: true
+        words:
+          - "access-control-allow-origin: https://{{rnd}}.autobb-cors-check.invalid"
+
+      - type: word
+        part: header
+        case-insensitive: true
+        words:
+          - "access-control-allow-credentials: true"

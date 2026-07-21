@@ -1,0 +1,49 @@
+id: autobb-missing-security-headers
+
+info:
+  name: All Key Security Headers Missing
+  author: autobb
+  severity: info
+  description: >
+    Flags a host only when ALL of CSP, HSTS, X-Content-Type-Options and
+    X-Frame-Options/frame-ancestors are absent at once. Checking headers
+    one-by-one produces mostly noise (most sites are missing one or two by
+    design); requiring all of them missing together is a much stronger,
+    lower-noise signal that hardening was never considered at all.
+  tags: autobb,misconfig,headers,info
+
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}"
+
+    matchers-condition: and
+    matchers:
+      - type: word
+        part: header
+        case-insensitive: true
+        negative: true
+        words:
+          - "content-security-policy"
+
+      - type: word
+        part: header
+        case-insensitive: true
+        negative: true
+        words:
+          - "strict-transport-security"
+
+      - type: word
+        part: header
+        case-insensitive: true
+        negative: true
+        words:
+          - "x-content-type-options"
+
+      - type: word
+        part: header
+        case-insensitive: true
+        negative: true
+        words:
+          - "x-frame-options"
+          - "frame-ancestors"

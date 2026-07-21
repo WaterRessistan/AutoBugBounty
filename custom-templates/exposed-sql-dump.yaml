@@ -1,0 +1,43 @@
+id: autobb-exposed-sql-dump
+
+info:
+  name: Exposed Plain-Text SQL Database Dump
+  author: autobb
+  severity: high
+  description: >
+    Detects publicly accessible SQL dump files by matching real dump-file
+    markers in the body (not just filename/extension), avoiding false
+    positives from HTML error pages served with a 200 status.
+  tags: autobb,exposure,backup,sql,misconfig
+
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}/backup.sql"
+      - "{{BaseURL}}/db.sql"
+      - "{{BaseURL}}/dump.sql"
+      - "{{BaseURL}}/database.sql"
+      - "{{BaseURL}}/data.sql"
+      - "{{BaseURL}}/db_backup.sql"
+
+    matchers-condition: and
+    matchers:
+      - type: status
+        status:
+          - 200
+
+      - type: word
+        part: body
+        condition: or
+        words:
+          - "-- MySQL dump"
+          - "-- PostgreSQL database dump"
+          - "CREATE TABLE"
+          - "INSERT INTO"
+
+      - type: word
+        part: body
+        negative: true
+        words:
+          - "<html"
+          - "<!DOCTYPE"

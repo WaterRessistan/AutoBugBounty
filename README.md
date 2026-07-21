@@ -31,6 +31,8 @@
 - [Scope: ¿con o sin subdominios?](#-scope-con-o-sin-subdominios)
 - [Niveles de intensidad](#-niveles-de-intensidad)
 - [Control de tiempo: nada se cuelga eternamente](#-control-de-tiempo-nada-se-cuelga-eternamente)
+- [Interactsh propio (OOB para SSRF/RCE ciegos)](#-interactsh-propio-oob-para-ssrfrce-ciegos)
+- [Falsos positivos: soft-404 / catch-all de WAF](#-falsos-positivos-soft-404--catch-all-de-waf)
 - [Estructura de resultados](#-estructura-de-resultados)
 - [Qué encuentra y qué no](#-qué-encuentra-y-qué-no)
 - [Docker](#-docker)
@@ -46,6 +48,10 @@
 - **Flag `--no-subs`.** Omite la enumeración *activa* de subdominios (más rápido y silencioso) sin renunciar a las URLs en scope que aparezcan por fuentes pasivas.
 - **Flujo de 7 fases**: subdominios → resolución/hosts vivos → subdomain takeover → recolección de URLs/directorios/endpoints → filtrado de sensibles/parámetros → escaneo de vulnerabilidades → reporte.
 - **Corte solo si se cuelga (watchdog).** Las fases pesadas (`katana`/`nuclei`) **no** tienen tope de tiempo: corren las horas que hagan falta mientras progresen, y solo se detienen si se quedan realmente colgadas. Ver [Control de tiempo](#-control-de-tiempo-nada-se-cuelga-eternamente).
+- **Una sola pasada de nuclei sobre plantillas de comunidad** (antes había dos que se solapaban casi al 100%), con `-etags tech` para excluir fingerprinting puro y bajar el ruido de "info" sin perder cobertura real.
+- **Interactsh propio, gestionado solo.** Si tienes tu `interactsh-server`, el script lo levanta solo para esa ejecución y lo apunta en todas las pasadas de nuclei para confirmar SSRF/RCE/XXE ciegos. Ver [Interactsh propio](#-interactsh-propio-oob-para-ssrfrce-ciegos).
+- **Señal de soft-404/WAF catch-all** antes de escanear, para saber de antemano qué hallazgos merecen doble verificación. Ver [Falsos positivos](#-falsos-positivos-soft-404--catch-all-de-waf).
+- **Evidencia/PoC por hallazgo crítico/alto** (`vulns/poc/`, con request/response) lista para justificar el reporte en tu programa de bug bounty.
 - **Notificaciones Discord + Telegram** nativas (solo `curl`), con envío del `summary.txt` adjunto al terminar cada target y un resumen global.
 - **Auto-instalación** de dependencias, plantillas de `nuclei`, plantillas de fuzzing/DAST y wordlist de directorios.
 - **Intensidad configurable** (`conservador` · `balanceado` · `agresivo`).
@@ -188,19 +194,25 @@ Si dejas la carpeta `custom-templates/` junto a `autobb.sh`, se incluye automát
 
 ### Pack incluido (`custom-templates/`)
 
-Plantillas de **detección** de alto valor y bajo ruido:
+Plantillas de **detección** de alto valor y bajo ruido. Todas usan condiciones
+AND estrictas (status + contenido específico, no un único string) para evitar
+falsos positivos por páginas de error/WAF que devuelven 200 en cualquier ruta:
 
 | Plantilla | Sev | Qué detecta |
 |-----------|-----|-------------|
-| `exposed-env-file`         | high   | `.env` accesible con credenciales |
-| `exposed-git-repo`         | high   | `.git/config` accesible (dump de código) |
-| `exposed-backup-archives`  | high   | backups/volcados SQL en la raíz web |
-| `secrets-in-response`      | high   | claves AWS/Google/Slack y *private keys* en el cuerpo |
-| `phpinfo-exposed`          | medium | `phpinfo()` expuesto |
-| `cors-reflected-origin`    | medium | CORS que refleja Origin + credentials |
-| `directory-listing`        | low    | autoindex/listado de directorios |
-| `exposed-api-docs`         | info   | Swagger/OpenAPI (superficie de la API) |
-| `missing-security-headers` | info   | faltan CSP/HSTS |
+| `exposed-env-file`             | high   | `.env` accesible con credenciales |
+| `exposed-git-repo`             | high   | `.git/config` accesible (dump de código) |
+| `exposed-backup-archives`      | high   | backups (zip/gzip/rar/7z) confirmados por firma binaria, no solo por nombre |
+| `exposed-sql-dump`             | high   | volcados SQL en texto plano confirmados por marcadores reales de dump |
+| `exposed-cloud-credentials`    | high   | `.aws/credentials`, claves SSH, `.git-credentials`, `.npmrc` |
+| `debug-mode-exposed`           | high   | *stack traces* de Laravel `APP_DEBUG`/Django `DEBUG=True`/Symfony |
+| `secrets-in-response`          | high   | claves AWS/Google/Slack/Stripe y *private keys* en el cuerpo |
+| `phpinfo-exposed`              | medium | `phpinfo()` expuesto |
+| `cors-reflected-origin`        | medium | CORS explotable: Origin reflejado **y** `Access-Control-Allow-Credentials: true` (el wildcard `*` con credentials no es explotable y no se reporta) |
+| `graphql-introspection-enabled`| medium | introspección de GraphQL confirmada con una query real (`__schema`) |
+| `directory-listing`            | low    | autoindex/listado de directorios |
+| `exposed-api-docs`             | info   | Swagger/OpenAPI (superficie de la API) |
+| `missing-security-headers`     | info   | faltan **todas** las cabeceras clave a la vez (CSP+HSTS+XCTO+XFO), no una a una |
 
 ### Colecciones externas recomendadas
 
@@ -245,6 +257,44 @@ El escaneo se protege contra bloqueos sin cortar el trabajo legítimo:
 - **Herramientas ligeras/medias** (enumeración, `dnsx`, `httpx`, `naabu`, `wayback`/`gau`, `subzy`, `ffuf`, `dalfox`): tope de tiempo fijo (10–20 min).
 - **Herramientas pesadas** (`katana`, `nuclei`): **vigilante de inactividad** en lugar de tope fijo. Corren sin límite mientras **progresen** (escriban resultados o estadísticas) y solo se detienen si pasan **15 min sin actividad** (ajustable con `--stall-timeout <min>`). Así un escaneo grande de horas termina entero, pero un cuelgue no bloquea la cola.
 
+## 🔭 Interactsh propio (OOB para SSRF/RCE/XXE ciegos)
+
+Por defecto, `nuclei` usa su servidor público de interactsh para confirmar
+inyecciones **ciegas** (el target no muestra nada en la respuesta, pero hace
+una petición de vuelta al servidor OOB). Si tienes tu propio `interactsh-server`,
+el script lo puede levantar **solo cuando hace falta** (no necesitas tenerlo
+corriendo 24/7):
+
+```ini
+# ~/.autobb.conf
+INTERACTSH_DOMAIN="oast.tudominio.com"   # obligatorio para activar el modo propio
+INTERACTSH_IP=""                          # opcional; se autodetecta si se deja vacío
+INTERACTSH_TOKEN=""                       # opcional
+```
+
+Con `INTERACTSH_DOMAIN` configurado, el script arranca `interactsh-server` al
+principio de la ejecución, apunta **todas** las pasadas de `nuclei` a él, y lo
+para al terminar (o al pulsar Ctrl+C). Si algo falla (binario ausente, puertos
+sin permisos...) se avisa y se sigue con el servidor público, sin abortar el
+escaneo.
+
+> [!IMPORTANT]
+> Para que el OOB funcione de verdad, `INTERACTSH_DOMAIN` debe ser un dominio
+> real **delegado por NS** a la IP pública de esta máquina, con los puertos
+> **53 (DNS), 80 y 443** accesibles desde Internet. Sin esa delegación, el
+> target nunca podrá "llamar a casa" y no verás interacciones.
+
+## 🎯 Falsos positivos: soft-404 / catch-all de WAF
+
+La causa nº1 de falsos positivos en recon automatizado es un host que responde
+**200 para cualquier ruta** (página de error "bonita", WAF, SPA con fallback a
+`index.html`...). Antes de `ffuf`/`nuclei`, el script sondea cada host vivo con
+una ruta inventada al azar; si responde 200, el host se lista en
+`urls/soft_404_hosts.txt` y aparece como aviso en `summary.txt`. **No se
+descarta nada automáticamente** — con pocos targets y revisión manual es mejor
+avisar que arriesgarse a esconder un verdadero positivo — pero sabrás de
+antemano qué hallazgos de esos hosts merecen doble verificación.
+
 ## 📂 Estructura de resultados
 
 ```text
@@ -260,20 +310,21 @@ autobb_results/
     │   ├── wayback.txt / gau.txt / katana.txt / ffuf.txt   # cada fuente por separado
     │   ├── all_urls_raw.txt      # todo lo recolectado (antes de filtrar)
     │   ├── all_urls_clean.txt    # 👈 SOLO lo que está EN SCOPE (lo que lee nuclei)
+    │   ├── soft_404_hosts.txt    # hosts con 200 en rutas inventadas (revisar con más ojo)
     │   ├── sensitive_files.txt   # ficheros potencialmente sensibles
     │   └── params/               # parámetros clasificados por tipo (xss, sqli, ...)
     ├── vulns/
-    │   ├── nuclei_hosts.txt      # plantillas comunidad sobre hosts vivos
-    │   ├── nuclei_urls.txt       # plantillas comunidad sobre todas las URLs
+    │   ├── nuclei_community.txt  # plantillas de comunidad sobre todas las URLs en scope
     │   ├── nuclei_params.txt     # fuzzing DAST sobre parámetros
     │   ├── nuclei_custom.txt     # 👈 TUS plantillas + pack incluido
     │   ├── nuclei_all.txt        # todos los hallazgos de nuclei consolidados
+    │   ├── poc/                  # 👈 evidencia (request/response) por hallazgo crítico/alto
     │   └── dalfox.txt            # XSS validados
     ├── logs/                     # salida cruda de cada herramienta
     └── summary.txt               # 👈 RESUMEN DE VULNERABILIDADES del target
 ```
 
-Al terminar la recolección verás un recuento del tipo `URLs recolectadas: 26330 · EN SCOPE (a escanear): 412 · fuera de scope: 25918`. El `summary.txt` incluye el recon, el recuento por severidad, los hallazgos críticos/altos listados, posibles takeovers, XSS confirmados y una muestra de ficheros sensibles.
+Al terminar la recolección verás un recuento del tipo `URLs recolectadas: 26330 · EN SCOPE (a escanear): 412 · fuera de scope: 25918`. El `summary.txt` incluye el recon, el recuento por severidad, los hallazgos críticos/altos listados, posibles takeovers, XSS confirmados, avisos de soft-404 y una muestra de ficheros sensibles.
 
 ## 🧠 Qué encuentra y qué no
 
@@ -281,6 +332,7 @@ La automatización cubre lo que se detecta por **patrón, firma o comportamiento
 
 - **Sí encuentra**: CVEs conocidos, misconfiguraciones, exposiciones de ficheros (`.env`, `.git`, backups), credenciales por defecto, subdomain takeovers, XSS reflejado, endpoints/directorios ocultos, y las inyecciones que disparan una respuesta reconocible (SQLi/SSRF/LFI/RCE vía fuzzing DAST o interactsh).
 - **No encuentra**: IDOR/BOLA, control de acceso roto, escalada de privilegios, bypass de autenticación, lógica de negocio, *race conditions* y, en general, todo lo que requiere **estar autenticado** o **entender la aplicación**.
+- **Ningún escaneo por firmas/patrones llega al 0% de falsos positivos.** Este proyecto reduce el ruido con matchers estrictos y con la señal de soft-404, pero la palabra final siempre es tuya: usa `vulns/poc/` para verificar antes de reportar.
 
 > Úsalo para cubrir rápido lo automatizable y liberar tiempo para el análisis manual — no para sustituirlo. El mayor valor de `nuclei` está en convertir tus hallazgos manuales en **plantillas propias** y lanzarlas en masa.
 

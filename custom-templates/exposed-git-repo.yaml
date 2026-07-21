@@ -1,0 +1,35 @@
+id: autobb-exposed-git-repo
+
+info:
+  name: Exposed .git/config (Git Repository Dump)
+  author: autobb
+  severity: high
+  description: >
+    Detects a publicly accessible .git/config file, which usually means the
+    whole .git directory (and source code history) can be dumped. Requires
+    the actual git-config structure in the body, not just a 200 status.
+  tags: autobb,exposure,git,config
+
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}/.git/config"
+
+    matchers-condition: and
+    matchers:
+      - type: status
+        status:
+          - 200
+
+      - type: word
+        part: body
+        condition: and
+        words:
+          - "[core]"
+          - "repositoryformatversion"
+
+      - type: word
+        part: body
+        negative: true
+        words:
+          - "<html"

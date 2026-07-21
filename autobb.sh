@@ -63,6 +63,19 @@ DISCORD_WEBHOOK_URL="${DISCORD_WEBHOOK_URL:-}"
 TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
 
+# --- Interactsh propio (self-hosted) para OOB (SSRF/RCE ciego) ---------------
+# Si INTERACTSH_DOMAIN está configurado y el binario existe, el script levanta
+# interactsh-server SOLO para esta ejecución (no hace falta tenerlo 24/7) y lo
+# apunta a nuclei; si no, nuclei usa su servidor público por defecto.
+INTERACTSH_DOMAIN="${INTERACTSH_DOMAIN:-}"
+INTERACTSH_IP="${INTERACTSH_IP:-}"
+INTERACTSH_TOKEN="${INTERACTSH_TOKEN:-}"
+INTERACTSH_SERVER_BIN="${INTERACTSH_SERVER_BIN:-interactsh-server}"
+declare -a NUCLEI_INTERACTSH_ARGS=()
+WE_STARTED_INTERACTSH=false
+INTERACTSH_PID=""
+NUCLEI_SUPPORTS_JLE=false
+
 # --- PATH para binarios de go / pipx / local ---------------------------------
 export PATH="$PATH:$HOME/go/bin:$HOME/.local/bin"
 if command -v go >/dev/null 2>&1; then GOPATH_BIN="$(go env GOPATH)/bin"; export PATH="$PATH:$GOPATH_BIN"; fi
@@ -76,7 +89,10 @@ phase() { echo -e "\n${BOLD}${MAGENTA}══════════ $* ══�
 step()  { echo -e "\n${BOLD}${CYAN}──── $* ────${NC}"; }
 have()  { command -v "$1" >/dev/null 2>&1; }
 
-trap 'err "Ejecución interrumpida por el usuario"; exit 130' INT
+on_interrupt() { err "Ejecución interrumpida por el usuario"; interactsh_stop; exit 130; }
+on_exit()      { interactsh_stop; }
+trap on_interrupt INT
+trap on_exit EXIT
 
 # --------------------------------------------------------------- BANNER ------
 banner() {
@@ -96,7 +112,9 @@ EOF
 
 # --------------------------------------------------------------- USAGE -------
 usage() {
-cat <<EOF
+# echo -e (en vez de 'cat') para que ${BOLD}/${NC} se interpreten como color
+# real y no se impriman como el literal "\033[1m".
+echo -e "$(cat <<EOF
 ${BOLD}AutoBugBounty v2${NC} — Recon & Vulnerability Scanner
 
 USO:
@@ -126,6 +144,7 @@ EJEMPLOS:
   $SCRIPT_NAME --no-subs app.example.com api.example.com
   $SCRIPT_NAME --intensity agresivo target1.com target2.com
 EOF
+)"
 }
 
 # --------------------------------------------------------- PARSEO DE ARGS ----
@@ -328,9 +347,123 @@ ensure_tools() {
       tcount="$(nuclei -tl -silent 2>/dev/null | grep -c . || echo 0)"
     fi
     ok "Plantillas de nuclei cargadas: ${tcount}"
+    # -jle (export JSONL adicional, con request/response) para poder extraer
+    # PoC de los hallazgos crit/high. Se comprueba en el binario instalado en
+    # vez de asumirlo, por si hay una versión de nuclei que no lo soporte.
+    NUCLEI_SUPPORTS_JLE=false
+    nuclei -h 2>&1 | grep -qE '\-jle,|\-jsonl-export' && NUCLEI_SUPPORTS_JLE=true
   fi
 
   have httpx || { err "httpx es imprescindible y no está disponible. Abortando."; exit 1; }
+}
+
+# ============================================================================
+#  INTERACTSH PROPIO (self-hosted) — OOB para SSRF/RCE/XXE ciegos
+# ============================================================================
+# No hace falta tenerlo corriendo 24/7: si INTERACTSH_DOMAIN está configurado
+# (env o ~/.autobb.conf) y el binario existe, se levanta SOLO para esta
+# ejecución y se para al terminar (o al interrumpir con Ctrl+C). Si algo falla
+# (binario ausente, puertos 53/80/443 sin permisos, dominio no delegado…) se
+# avisa y se continúa con el servidor público de nuclei: nunca se aborta el
+# escaneo por esto.
+#
+# IMPORTANTE: para que el OOB funcione de verdad, INTERACTSH_DOMAIN debe ser
+# un dominio real delegado (registros NS) a la IP pública de esta máquina, con
+# los puertos 53 (DNS), 80 y 443 accesibles desde Internet. Si solo lo pruebas
+# en local sin esa delegación, los targets nunca podrán "llamar a casa".
+INTERACTSH_URL=""
+
+interactsh_pidfile() { echo "${BASE_OUTPUT}/.interactsh-server.pid"; }
+
+interactsh_maybe_start() {
+  [ -n "$INTERACTSH_DOMAIN" ] || return 0   # sin dominio configurado → modo público, nada que hacer
+
+  if ! have "$INTERACTSH_SERVER_BIN"; then
+    warn "INTERACTSH_DOMAIN configurado pero '${INTERACTSH_SERVER_BIN}' no está instalado → se usa el servidor público de nuclei."
+    return 0
+  fi
+
+  # ¿Ya hay una instancia nuestra viva de una ejecución anterior? (no debería,
+  # pero por si el script se cortó sin limpiar). La reutilizamos en vez de
+  # lanzar una segunda.
+  local pf; pf="$(interactsh_pidfile)"
+  if [ -f "$pf" ] && kill -0 "$(cat "$pf" 2>/dev/null)" 2>/dev/null; then
+    INTERACTSH_PID="$(cat "$pf")"
+    INTERACTSH_URL="https://${INTERACTSH_DOMAIN}"
+    ok "interactsh-server ya estaba corriendo (PID ${INTERACTSH_PID}); se reutiliza."
+    build_nuclei_interactsh_args
+    return 0
+  fi
+
+  step "Levantando interactsh-server propio (${INTERACTSH_DOMAIN})"
+  # Se comprueban los flags contra la ayuda del binario instalado (en vez de
+  # asumir nombres fijos): las versiones de interactsh-server han cambiado
+  # algunos flags de auth entre releases. -domain es estable en todas.
+  local sh; sh="$("$INTERACTSH_SERVER_BIN" -h 2>&1 || true)"
+  local -a args=(-domain "$INTERACTSH_DOMAIN")
+  [ -n "$INTERACTSH_IP" ] || INTERACTSH_IP="$(curl -s --max-time 5 https://ifconfig.me 2>/dev/null || true)"
+  if [ -n "$INTERACTSH_IP" ] && echo "$sh" | grep -qE '(^|[[:space:]])-ip(,|[[:space:]])'; then
+    args+=(-ip "$INTERACTSH_IP")
+  fi
+  if [ -n "$INTERACTSH_TOKEN" ]; then
+    if echo "$sh" | grep -qE '\-token(,|[[:space:]])'; then
+      args+=(-auth -token "$INTERACTSH_TOKEN")
+    elif echo "$sh" | grep -qE '\-auth(,|[[:space:]])'; then
+      args+=(-auth)
+      warn "Tu interactsh-server no admite -token; genera uno propio y lo mostrará en ${BASE_OUTPUT}/interactsh-server.log (revísalo y pásalo a INTERACTSH_TOKEN/nuclei -itoken a mano si lo necesitas)."
+    else
+      warn "INTERACTSH_TOKEN configurado pero este binario no expone flags de auth reconocidos; se arranca sin autenticación."
+    fi
+  fi
+
+  mkdir -p "$(dirname "$pf")"
+  nohup "$INTERACTSH_SERVER_BIN" "${args[@]}" >"${BASE_OUTPUT}/interactsh-server.log" 2>&1 &
+  INTERACTSH_PID=$!
+  echo "$INTERACTSH_PID" > "$pf"
+
+  local waited=0
+  while [ "$waited" -lt 15 ]; do
+    if ! kill -0 "$INTERACTSH_PID" 2>/dev/null; then break; fi
+    grep -qiE "listening|started|dns server" "${BASE_OUTPUT}/interactsh-server.log" 2>/dev/null && break
+    sleep 1; waited=$((waited + 1))
+  done
+
+  if kill -0 "$INTERACTSH_PID" 2>/dev/null; then
+    WE_STARTED_INTERACTSH=true
+    INTERACTSH_URL="https://${INTERACTSH_DOMAIN}"
+    ok "interactsh-server activo (PID ${INTERACTSH_PID}) → nuclei usará ${INTERACTSH_URL}"
+    build_nuclei_interactsh_args
+  else
+    warn "No se pudo levantar interactsh-server (revisa ${BASE_OUTPUT}/interactsh-server.log); se usa el servidor público de nuclei."
+    rm -f "$pf"
+  fi
+}
+
+interactsh_stop() {
+  $WE_STARTED_INTERACTSH || return 0
+  [ -n "$INTERACTSH_PID" ] || return 0
+  if kill -0 "$INTERACTSH_PID" 2>/dev/null; then
+    kill -TERM "$INTERACTSH_PID" 2>/dev/null
+    sleep 2
+    kill -KILL "$INTERACTSH_PID" 2>/dev/null
+  fi
+  rm -f "$(interactsh_pidfile)"
+  WE_STARTED_INTERACTSH=false
+}
+
+# Construye NUCLEI_INTERACTSH_ARGS comprobando en el binario instalado que los
+# flags existen (robustez entre versiones de nuclei), en vez de asumirlos.
+build_nuclei_interactsh_args() {
+  NUCLEI_INTERACTSH_ARGS=()
+  [ -n "$INTERACTSH_URL" ] || return 0
+  have nuclei || return 0
+  local h; h="$(nuclei -h 2>&1)"
+  if echo "$h" | grep -qE '\-iserver,|\-interactsh-server'; then
+    NUCLEI_INTERACTSH_ARGS+=(-iserver "$INTERACTSH_URL")
+    if [ -n "$INTERACTSH_TOKEN" ] && echo "$h" | grep -qE '\-itoken,|\-interactsh-token'; then
+      NUCLEI_INTERACTSH_ARGS+=(-itoken "$INTERACTSH_TOKEN")
+    fi
+  fi
 }
 
 # ============================================================================
@@ -405,6 +538,23 @@ in_scope_filter() {
       u = tolower(u)
       if (u == t || u ~ ("\\." esc "$")) print $0 }
   ' "$infile" > "$outfile"
+}
+
+# Extensiones extra para ffuf según la tecnología que detectó httpx (-td) para
+# ese host concreto en subdomains/live_hosts.jsonl. Vacío si no hay jq/JSON o
+# no se reconoce ninguna tecnología: ffuf sigue funcionando sin extensiones.
+ffuf_ext_for_host() {                      # $1 = URL raíz del host
+  $HAVE_JQ || return 0
+  [ -s subdomains/live_hosts.jsonl ] || return 0
+  local tech; tech="$(jq -r --arg u "$1" 'select(.url==$u) | ((.tech // []) | join(","))' \
+    subdomains/live_hosts.jsonl 2>/dev/null | head -n1)"
+  tech="$(printf '%s' "$tech" | tr '[:upper:]' '[:lower:]')"
+  case "$tech" in
+    *php*)                 echo ".php,.phtml,.php.bak,.php~" ;;
+    *asp.net*|*iis*)       echo ".asp,.aspx,.config,.asmx" ;;
+    *java*|*tomcat*|*jsp*) echo ".jsp,.jspx,.action,.do" ;;
+    *) : ;;
+  esac
 }
 
 # Ejecuta un comando registrando su salida en logs/<name>.log
@@ -554,7 +704,8 @@ process_target() {
   else
     step "FASE 1 · Enumeración de subdominios"
     gtrun subfinder    subfinder    "$TMO_LIGHT" subfinder -d "$target" -all -recursive -silent -o subdomains/subfinder.txt
-    gtrun assetfinder  assetfinder  "$TMO_LIGHT" bash -c "assetfinder --subs-only '$target' > subdomains/assetfinder.txt"
+    # shellcheck disable=SC2016  # comillas simples intencionadas: $1 se expande dentro del bash -c hijo, no aquí (evita inyección si $target trae comillas)
+    gtrun assetfinder  assetfinder  "$TMO_LIGHT" bash -c 'assetfinder --subs-only "$1" > subdomains/assetfinder.txt' bash "$target"
     gtrun findomain    findomain    "$TMO_LIGHT" findomain -t "$target" -q -u subdomains/findomain.txt
     gtrun subdominator subdominator "$TMO_LIGHT" subdominator -d "$target" -o subdomains/subdominator.txt
     gtrun sublist3r    sublist3r    "$TMO_LIGHT" sublist3r -d "$target" -t 50 -o subdomains/sublist3r.txt
@@ -655,6 +806,39 @@ process_target() {
   n_live="$(count_lines subdomains/live_urls.txt)"
   ok "Hosts vivos tras feedback: ${BOLD}${n_live}${NC}"
 
+  # 4b-bis) Línea base de soft-404 / catch-all de WAF --------------------------
+  # La causa nº1 de falsos positivos en recon automatizado: un host que responde
+  # 200 para CUALQUIER ruta (página bonita de "no encontrado", WAF, SPA con
+  # fallback a index...). No se descarta nada automáticamente (con pocos
+  # targets y revisión manual es mejor avisar que arriesgar falsos negativos),
+  # pero se deja constancia explícita para revisar esos hallazgos con más ojo.
+  : > urls/soft_404_hosts.txt
+  if [ -s subdomains/live_urls.txt ] && have httpx; then
+    local probe_file; probe_file="$(mktemp)"
+    while IFS= read -r root; do
+      [ -n "$root" ] || continue
+      printf '%s/autobb-probe-%s%s.html\n' "${root%/}" "$RANDOM" "$RANDOM" >> "$probe_file"
+    done < subdomains/live_urls.txt
+    if [ -s "$probe_file" ]; then
+      if $HAVE_JQ; then
+        gtrun httpx-baseline httpx "$TMO_LIGHT" httpx -l "$probe_file" \
+            -threads "$HTTPX_THREADS" -silent -nc -sc -cl -json -o urls/_baseline.jsonl
+        if [ -s urls/_baseline.jsonl ]; then
+          jq -r 'select(.status_code==200) | .url' urls/_baseline.jsonl 2>/dev/null \
+            | sed -E 's#^[a-zA-Z]+://##; s#/.*$##' | sort -u > urls/soft_404_hosts.txt
+        fi
+      else
+        gtrun httpx-baseline httpx "$TMO_LIGHT" httpx -l "$probe_file" \
+            -threads "$HTTPX_THREADS" -silent -nc -mc 200 -o urls/_baseline.txt
+        [ -s urls/_baseline.txt ] && awk '{print $1}' urls/_baseline.txt \
+          | sed -E 's#^[a-zA-Z]+://##; s#/.*$##' | sort -u > urls/soft_404_hosts.txt
+      fi
+    fi
+    rm -f "$probe_file"
+  fi
+  local n_soft404; n_soft404="$(count_lines urls/soft_404_hosts.txt)"
+  [ "$n_soft404" -gt 0 ] && warn "Soft-404/WAF catch-all en ${BOLD}${n_soft404}${NC} host(s) (ver urls/soft_404_hosts.txt) → revisa sus hallazgos de ffuf/nuclei con más escepticismo"
+
   # 4c) Katana (crawl activo) sobre los hosts vivos ----------------------------
   # Scope de Katana: con --no-subs, host exacto (fqdn); si no, dominio+subs (rdn).
   local katana_scope="rdn"; $NO_SUBS && katana_scope="fqdn"
@@ -675,17 +859,24 @@ process_target() {
   fi
 
   # 4d) Fuerza bruta de directorios/endpoints con ffuf sobre cada host vivo -----
+  # Extensiones dinámicas según la tecnología detectada por httpx (-td en Fase 2):
+  # PHP/ASP/JSP suelen esconder backups .bak/.phtml/.config específicos de stack
+  # que una wordlist genérica sin extensiones no encuentra.
   : > urls/ffuf.txt
   if have ffuf && [ -s subdomains/live_urls.txt ] && [ -s "$DIRB_WORDLIST" ]; then
-    local root ftmp label
+    local root ftmp label ext_arg extra_ext
     while IFS= read -r root; do
       [ -n "$root" ] || continue
       ftmp="$(mktemp)"
       label="ffuf_$(printf '%s' "$root" | tr -c 'a-zA-Z0-9' '_')"
+      ext_arg=()
+      extra_ext="$(ffuf_ext_for_host "$root")"
+      [ -n "$extra_ext" ] && ext_arg=(-e "$extra_ext")
       trun "$label" "$TMO_MED" \
         ffuf -u "${root%/}/FUZZ" -w "$DIRB_WORDLIST" \
              -mc 200,201,202,204,301,302,307,308,401,403,405,500 \
              -t "$FFUF_THREADS" -rate "$KATANA_RL" -timeout 8 -ac -s \
+             "${ext_arg[@]}" \
              -of json -o "$ftmp"
       if [ -s "$ftmp" ] && $HAVE_JQ; then
         jq -r '.results[]?.url' "$ftmp" 2>/dev/null >> urls/ffuf.txt
@@ -742,53 +933,62 @@ process_target() {
 
   # ----------------------------- FASE 6: ESCANEO DE VULNERABILIDADES --------
   step "FASE 6 · Escaneo de vulnerabilidades (nuclei + dalfox)"
-  if ! $ONLY_CUSTOM && [ -s subdomains/live_urls.txt ]; then
-    # NOTA: se filtra SOLO por severidad. Antes se combinaba -tags + -severity y,
-    # como nuclei aplica los filtros con AND, esa lista de tags descartaba la
-    # mayoría de plantillas (de ahí los "0 hallazgos"). Sin -tags corren casi
-    # todas las plantillas de la comunidad (las intrusivas/DoS siguen excluidas
-    # por defecto). Reduce las severidades si quieres menos ruido.
-    gwrun nuclei nuclei vulns/nuclei_hosts.txt "$STALL_HEAVY" nuclei \
-        -l subdomains/live_urls.txt \
-        -severity critical,high,medium,low,info \
-        -rl "$NUCLEI_RL" -c "$NUCLEI_C" -timeout 8 -retries 1 -silent -stats \
-        -o vulns/nuclei_hosts.txt
-  elif $ONLY_CUSTOM; then
-    warn "--only-custom activo; se omiten las plantillas de la comunidad (hosts)"
-  else
-    warn "Sin hosts vivos; nuclei (hosts) se omite"
-  fi
 
+  # UNA sola pasada de plantillas de comunidad sobre all_urls_clean.txt: ese
+  # fichero ya incluye las raíces vivas (live_urls.txt se añade siempre en la
+  # consolidación de Fase 4), así que escanear live_urls.txt por separado era
+  # repetir el mismo trabajo dos veces sin ganar cobertura. -etags tech excluye
+  # el fingerprinting puro (no es una vulnerabilidad; son ~950 plantillas de
+  # ruido) manteniendo el resto de severidades intacto.
+  local -a jle_community=()
+  $NUCLEI_SUPPORTS_JLE && jle_community=(-jle vulns/nuclei_community.jsonl)
   if ! $ONLY_CUSTOM && [ -s urls/all_urls_clean.txt ]; then
-    gwrun nuclei-urls nuclei vulns/nuclei_urls.txt "$STALL_HEAVY" nuclei \
+    gwrun nuclei-community nuclei vulns/nuclei_community.txt "$STALL_HEAVY" nuclei \
         -l urls/all_urls_clean.txt \
-        -severity critical,high,medium,low \
-        -rl "$NUCLEI_RL" -c "$NUCLEI_C" -timeout 5 -retries 1 -silent -stats \
-        -o vulns/nuclei_urls.txt
+        -severity critical,high,medium,low,info \
+        -etags tech \
+        "${NUCLEI_INTERACTSH_ARGS[@]}" \
+        -rl "$NUCLEI_RL" -c "$NUCLEI_C" -timeout 8 -retries 1 -silent -stats \
+        "${jle_community[@]}" \
+        -o vulns/nuclei_community.txt
+  elif $ONLY_CUSTOM; then
+    warn "--only-custom activo; se omiten las plantillas de la comunidad"
+  else
+    warn "Sin URLs en scope; nuclei (comunidad) se omite"
   fi
 
   # --- PASADA DEDICADA: TUS plantillas (pack + --templates) ------------------
   # Sin filtro de severidad → corren TODAS tus plantillas contra todas las URLs
   # en scope (el fichero all_urls_clean.txt incluye raíces vivas + endpoints).
+  local -a jle_custom=()
+  $NUCLEI_SUPPORTS_JLE && jle_custom=(-jle vulns/nuclei_custom.jsonl)
   if $HAVE_CUSTOM_TPL && [ -s urls/all_urls_clean.txt ]; then
     gwrun nuclei-custom nuclei vulns/nuclei_custom.txt "$STALL_HEAVY" nuclei \
         -l urls/all_urls_clean.txt \
         "${NUCLEI_CUSTOM_ARGS[@]}" \
+        "${NUCLEI_INTERACTSH_ARGS[@]}" \
         -rl "$NUCLEI_RL" -c "$NUCLEI_C" -timeout 8 -retries 1 -silent -stats \
+        "${jle_custom[@]}" \
         -o vulns/nuclei_custom.txt
   fi
 
   cat urls/params/*.txt 2>/dev/null | sort -u > urls/params/_all_params.txt || true
+  local -a jle_params=()
+  $NUCLEI_SUPPORTS_JLE && jle_params=(-jle vulns/nuclei_params.jsonl)
   if [ -s urls/params/_all_params.txt ]; then
     # DAST/fuzzing de parámetros. Requiere el repo 'fuzzing-templates' (aparte) y
     # el flag -dast. Antes esta fase pasaba -dast pero SIN cargar esas plantillas,
     # así que no probaba absolutamente nada. Ahora se apuntan explícitamente.
+    # Es aquí donde interactsh propio más importa: SSRF/RCE/XXE ciegos se
+    # confirman por callback OOB, no por diferencia visible en la respuesta.
     if [ -d "$FUZZ_TEMPLATES_DIR" ] && [ -n "$(ls -A "$FUZZ_TEMPLATES_DIR" 2>/dev/null)" ]; then
       gwrun nuclei-params nuclei vulns/nuclei_params.txt "$STALL_HEAVY" nuclei \
           -l urls/params/_all_params.txt \
           -t "$FUZZ_TEMPLATES_DIR" -dast \
           -severity critical,high,medium,low \
+          "${NUCLEI_INTERACTSH_ARGS[@]}" \
           -rl "$NUCLEI_RL" -c "$NUCLEI_C" -timeout 5 -retries 1 -silent -stats \
+          "${jle_params[@]}" \
           -o vulns/nuclei_params.txt
     else
       warn "Plantillas de fuzzing (DAST) no disponibles → 'nuclei -dast' se omite. Clónalas con: git clone https://github.com/projectdiscovery/fuzzing-templates \"$FUZZ_TEMPLATES_DIR\"  (para XSS se usa dalfox)."
@@ -804,7 +1004,7 @@ process_target() {
     fi
   fi
 
-  cat vulns/nuclei_hosts.txt vulns/nuclei_urls.txt vulns/nuclei_params.txt vulns/nuclei_custom.txt 2>/dev/null | sort -u > vulns/nuclei_all.txt || true
+  cat vulns/nuclei_community.txt vulns/nuclei_params.txt vulns/nuclei_custom.txt 2>/dev/null | sort -u > vulns/nuclei_all.txt || true
 
   # recuento de severidades
   local c_crit c_high c_med c_low c_info n_take n_dalfox
@@ -815,6 +1015,39 @@ process_target() {
   c_info="$(sev_count vulns/nuclei_all.txt info)"
   n_take="$(count_lines subdomains/takeover.txt)"
   n_dalfox="$(grep -icE '\[POC\]' vulns/dalfox.txt 2>/dev/null || echo 0)"; n_dalfox="${n_dalfox:-0}"
+
+  # --- Evidencia/PoC estructurada para hallazgos CRÍTICOS/ALTOS ---------------
+  # nuclei incluye request/response en el JSONL por defecto (-irr, activo salvo
+  # que el binario tenga -omit-raw); se vuelca un fichero por hallazgo para
+  # poder justificar el reporte en YesWeHack sin tener que re-lanzar nada a mano.
+  local n_poc=0
+  if $HAVE_JQ; then
+    mkdir -p vulns/poc
+    local jf
+    for jf in vulns/nuclei_community.jsonl vulns/nuclei_custom.jsonl vulns/nuclei_params.jsonl; do
+      [ -s "$jf" ] || continue
+      while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        local tid host sev matched req resp fname
+        tid="$(jq -r '."template-id" // "unknown"' <<<"$line" 2>/dev/null)"
+        host="$(jq -r '.host // .url // "unknown"' <<<"$line" 2>/dev/null)"
+        sev="$(jq -r '.info.severity // "unknown"' <<<"$line" 2>/dev/null)"
+        matched="$(jq -r '."matched-at" // .url // ""' <<<"$line" 2>/dev/null)"
+        req="$(jq -r '.request // ""' <<<"$line" 2>/dev/null)"
+        resp="$(jq -r '.response // ""' <<<"$line" 2>/dev/null)"
+        fname="vulns/poc/${tid}__$(printf '%s' "$host" | tr -c 'a-zA-Z0-9._-' '_').txt"
+        {
+          echo "Template : $tid"
+          echo "Severidad: $sev"
+          echo "Host     : $host"
+          echo "Matched  : $matched"
+          echo "--- REQUEST ---"; printf '%s\n' "$req"
+          echo "--- RESPONSE (recortada) ---"; printf '%s\n' "$resp" | head -c 4000
+        } > "$fname" 2>/dev/null
+        n_poc=$((n_poc + 1))
+      done < <(jq -c 'select(.info.severity=="critical" or .info.severity=="high")' "$jf" 2>/dev/null)
+    done
+  fi
 
   # ----------------------------- FASE 7: RESUMEN POR TARGET ----------------
   step "FASE 7 · Generando resumen"
@@ -868,12 +1101,22 @@ process_target() {
       head -n 30 urls/sensitive_files.txt | sed 's/^/  /'
       echo
     fi
+    if [ -s urls/soft_404_hosts.txt ]; then
+      echo ">>> ⚠ SOFT-404 / WAF CATCH-ALL (revisa estos hallazgos con más ojo) <<<"
+      echo "  Estos hosts devolvieron 200 en una ruta inventada al azar:"
+      sed 's/^/    /' urls/soft_404_hosts.txt
+      echo "  → ffuf/nuclei pueden dar falsos positivos aquí; confirma manualmente."
+      echo
+    fi
     echo "----------------------- ARCHIVOS CLAVE -------------------------"
     echo "  Subdominios   : $dir/subdomains/all_subs.txt"
     echo "  Hosts vivos   : $dir/subdomains/live_hosts.txt"
     echo "  URLs          : $dir/urls/all_urls_clean.txt"
     echo "  Sensibles     : $dir/urls/sensitive_files.txt"
     echo "  Nuclei (todo) : $dir/vulns/nuclei_all.txt"
+    if [ "${n_poc:-0}" -gt 0 ]; then
+      echo "  PoC crit/high : $dir/vulns/poc/  (${n_poc} fichero(s) con request/response para el reporte)"
+    fi
     echo "================================================================"
   } > "$summary"
 
@@ -914,6 +1157,7 @@ main() {
   ensure_tools
   HAVE_JQ=false; have jq && HAVE_JQ=true   # re-check tras posible instalación
   build_nuclei_custom_args
+  interactsh_maybe_start
 
   # estado de notificaciones
   if [ -z "$DISCORD_WEBHOOK_URL" ] && { [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; }; then
@@ -932,6 +1176,8 @@ main() {
     process_target "$t" || warn "El target '$t' terminó con errores."
     cd "$START_PWD" || true
   done
+
+  interactsh_stop
 
   local run_end total_dur
   run_end="$(date +%s)"; total_dur="$(fmt_duration $((run_end - RUN_START_EPOCH)))"

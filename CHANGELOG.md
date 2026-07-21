@@ -5,6 +5,61 @@ Todos los cambios notables de este proyecto se documentan en este fichero.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/)
 y el proyecto sigue [Versionado Semántico](https://semver.org/lang/es/).
 
+## [2.3.0] - 2026-07-21
+
+Release centrada en **subir la señal real y bajar los falsos positivos**, y en
+poder confiar de verdad en lo que promete el README.
+
+### Añadido
+- **Pack `custom-templates/` implementado de verdad.** El README y el CHANGELOG llevaban desde la 2.2.0 anunciando este pack como "tu ventaja real" pero la carpeta nunca llegó a existir en el repositorio: ninguna de esas plantillas se ejecutaba. Ahora sí, con 13 plantillas nuevas, cada una con matchers estrictos (status + contenido específico + negativos anti-soft-404) en vez de un único string: `exposed-env-file`, `exposed-git-repo`, `exposed-backup-archives`, `exposed-sql-dump`, `secrets-in-response`, `phpinfo-exposed`, `cors-reflected-origin`, `directory-listing`, `exposed-api-docs`, `missing-security-headers`, `graphql-introspection-enabled`, `debug-mode-exposed`, `exposed-cloud-credentials`.
+- **Señal de soft-404 / WAF catch-all**: se sondea cada host vivo con una ruta inventada al azar; si responde 200, se lista en `urls/soft_404_hosts.txt` y se avisa en `summary.txt` para revisar esos hallazgos con más escepticismo. No se descarta nada automáticamente.
+- **Evidencia/PoC estructurada** para hallazgos crítico/alto: además del `.txt` de siempre, nuclei exporta JSONL (`-jle`, con request/response incluidos) y el script vuelca un fichero por hallazgo en `vulns/poc/` listo para justificar el reporte en YesWeHack.
+- **Interactsh propio auto-gestionado**: si configuras `INTERACTSH_DOMAIN` (`.autobb.conf`), el script levanta tu `interactsh-server` solo para esa ejecución (no hace falta tenerlo 24/7), apunta todas las pasadas de nuclei a él y lo para al terminar o al interrumpir con Ctrl+C. Sin configurar, sigue usando el servidor público de nuclei como hasta ahora.
+- **Extensiones dinámicas en `ffuf`** según la tecnología detectada por `httpx` (PHP/ASP.NET/Java) para cubrir backups y rutas específicas de stack que la wordlist genérica no trae.
+
+### Cambiado
+- **Fusionadas las dos pasadas de nuclei que se solapaban**: `nuclei_hosts.txt` (sobre las raíces vivas) y `nuclei_urls.txt` (sobre todas las URLs, que ya incluían esas mismas raíces) eran prácticamente el mismo escaneo repetido dos veces. Ahora es una sola pasada `nuclei_community.txt` sobre `urls/all_urls_clean.txt` con la severidad más amplia de las dos, misma o mayor cobertura en ~la mitad de tiempo.
+- Las plantillas de comunidad ahora excluyen `-etags tech` (fingerprinting puro, ~950 plantillas que nunca son una vulnerabilidad) para bajar el ruido de "info" sin perder severidades reales.
+- Higiene del repositorio: se elimina la copia anidada `autobb-repo/` y el `autobb-repo.zip` que estaban trackeados por error en la raíz (y que además tenían ficheros — `SECURITY.md`, `.gitignore`, `.autobb.conf.example`, `.github/`, el CHANGELOG con la entrada 2.2.0 — que faltaban en la raíz "real" del proyecto).
+
+### Corregido
+- **Inyección de comandos** en la llamada a `assetfinder` (`bash -c "... '$target' ..."`): si `$target` contenía una comilla simple, rompía el escape. Se pasa ahora como parámetro posicional, sin interpolar en la cadena.
+
+## [2.2.0] - 2026-07-15
+
+Release centrada en **arreglar los "0 hallazgos"** y en hacer que la recolección de
+URLs sea completa y robusta antes de pasarla a `nuclei`, además de permitir
+plantillas de `nuclei` propias.
+
+### Añadido
+- **Fuerza bruta de directorios/endpoints con `ffuf`** sobre cada host vivo, con descarga automática de la wordlist (SecLists `common.txt`). Nueva concurrencia por intensidad `FFUF_THREADS` (20 / 40 / 60).
+- **Bucle de retroalimentación (feedback) en la recolección de URLs**: se extraen los hosts *en scope* de las URLs pasivas (`wayback`/`gau`), se reprueban con `httpx` y los vivos se añaden a la lista de hosts vivos. Rescata `www.` y subdominios que el apex no revelaba.
+- **Semilla `www.<target>`** como candidato de host desde la Fase 1.
+- **Plantillas de `nuclei` personalizables** con nuevas flags:
+  - `--templates <paths>`: añade plantillas/dirs propios (coma-sep).
+  - `--only-custom`: ejecuta **solo** tus plantillas + el pack (omite el set de la comunidad).
+  - `--exclude-templates <paths>`: excluye plantillas/dirs.
+  - `--no-custom-pack`: no incluir el pack de la repo.
+  - Tus plantillas corren en una **pasada dedicada sin filtro de severidad** contra todas las URLs en scope (así se ejecutan todas, incluidas las `info`), y sus hallazgos se mezclan en `nuclei_all.txt`.
+- **Pack de plantillas incluido** en `custom-templates/` (auto-detectado junto a `autobb.sh`): `exposed-env-file`, `exposed-git-repo`, `exposed-backup-archives`, `secrets-in-response`, `phpinfo-exposed`, `cors-reflected-origin`, `directory-listing`, `exposed-api-docs`, `missing-security-headers`.
+- **Descarga automática de `fuzzing-templates`** (repositorio aparte, necesario para el modo DAST de `nuclei`).
+- **Verificación de plantillas de `nuclei`** al arranque: si faltan, se descargan aunque se use `--no-install` (sin plantillas, `nuclei` no reporta nada).
+- Nuevo fichero de salida `vulns/nuclei_custom.txt` y ficheros por fuente en `urls/` (`wayback.txt`, `gau.txt`, `katana.txt`, `ffuf.txt`).
+
+### Cambiado
+- ⚠️ **Comportamiento de scope con `--no-subs`.** Ahora el filtro conserva el **dominio objetivo y sus subdominios** en ambos modos; `--no-subs` solo omite la *enumeración activa* de subdominios. Antes dejaba únicamente el host exacto, lo que causaba `en scope: 0` cuando el sitio servía en `www` y no en el apex. **Si tu programa autoriza solo el apex, revisa `urls/all_urls_clean.txt` antes de escanear.**
+- **Fase 4 reestructurada**: primero fuentes pasivas (funcionan sin hosts vivos), luego feedback, después `katana` y `ffuf`. `katana` ya no hace que se salte la fase entera cuando hay 0 hosts vivos.
+- El fichero que consume `nuclei` (`urls/all_urls_clean.txt`) ahora consolida `katana` + `wayback` + `gau` + `ffuf` + raíces vivas.
+- Filtro de scope insensible a mayúsculas y con **límites de dominio reales**: rechaza suplantaciones tipo `evil-target.com.attacker.tld`.
+- El control de tiempo de las fases pesadas es un **vigilante de inactividad** (`--stall-timeout <min>`, def. 15) en lugar de un tope fijo por fase: corren mientras progresen y solo se cortan si se cuelgan de verdad.
+
+### Corregido
+- **Causa raíz de "no encuentra ni una vulnerabilidad"**: `nuclei` combinaba `-tags` con `-severity`, y como los filtros se aplican con **AND**, esa lista de tags descartaba la mayoría de plantillas. Eliminado el `-tags`; ahora se filtra solo por severidad (corren casi todas las plantillas; las intrusivas/DoS siguen excluidas por defecto).
+- **Modo DAST de parámetros inoperante**: se pasaba `nuclei -dast` pero sin cargar las plantillas de fuzzing (que viven en un repo aparte), así que no probaba nada. Ahora se descargan y se apuntan con `-t`.
+- **Scope en `--no-subs` descartaba todas las URLs de subdominios** (`www.`, `api.`…), dando `en scope: 0` aunque `wayback`/`gau` hubieran encontrado decenas de URLs válidas.
+- **Expansión de array de puertos vacío en `httpx`** tras un `naabu` con resultados, que podía abortar la fase (y dejar 0 hosts vivos → 0 de todo) en `bash` con `set -u` estricto.
+- **`dalfox`** ahora recae en `urls/params/interesting.txt` si `gf` no generó `xss.txt`, para no quedarse sin ejecutar.
+
 ## [2.1.0] - 2026-07-12
 
 ### Añadido
